@@ -97,6 +97,16 @@ impl Device {
     /// still covers `want`, not the raw request — a USB3 pipe read is a multiple of 16 bytes and a
     /// KDI frame usually is not.
     pub fn start(&mut self, s: Stream, a: &Acquisition) -> Result<StreamReader<'_>, Error> {
+        // #131: an unconfigured device emits NOTHING on rhd_matrix, by design -- before this
+        // contract it emitted one frame per twenty sample periods while declaring the full cadence,
+        // which no host could detect. Without this check a host that forgot `set_rate` gets a
+        // silent stream and no reason, so name the missing call instead.
+        if s == Stream::Samples && self.caps().has(crate::Cap::RateControl) && !self.rate_ready()? {
+            return Err(io_err(
+                io::ErrorKind::InvalidInput,
+                "the acquisition rate is not configured, so rhd_matrix emits nothing:                  call Device::set_rate first (contract 0.5, rate_control)",
+            ));
+        }
         let (run, burst, _, lanes) = stream_regs(s);
         let bound = match a.burst {
             Some(want) => codec::aligned_burst_at_least(

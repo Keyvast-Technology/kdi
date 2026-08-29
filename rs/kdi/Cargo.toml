@@ -68,6 +68,18 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Calls `Device::open_usb3`, which only exists under the `usb3` feature. Without this entry a plain
 # `cargo clippy --all-targets` builds the example featureless and fails on the missing method.
 [[example]]
+name = "health"
+required-features = ["usb3"]
+
+[[example]]
+name = "rate_acceptance"
+required-features = ["usb3"]
+
+[[example]]
+name = "emit_rate"
+required-features = ["usb3"]
+
+[[example]]
 name = "usb3_handshake"
 required-features = ["usb3"]
 

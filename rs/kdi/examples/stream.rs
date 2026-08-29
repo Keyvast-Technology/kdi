@@ -48,6 +48,14 @@ fn main() -> Result<(), kdi::Error> {
     // `open` is the whole bind: not-KDI, contract major, `contract_ready`, capabilities, lease.
     let mut dev = Device::open(info, &ConnectOpts::default())?;
 
+    // EVERY HOST OWES THIS WRITE (#131, contract 0.5). An unconfigured device emits nothing on
+    // `rhd_matrix`, and before the capability existed it emitted one frame per twenty sample
+    // periods while declaring the full cadence. Non-fatal, so this still runs against pre-0.5
+    // gateware, where the rate is whatever the last host left.
+    if let Err(e) = dev.set_rate(42, 25) {
+        eprintln!("note: rate not configured ({e}) - pre-0.5 gateware");
+    }
+
     // `start` stops the stream, arms it and starts it — the falling edge is what flushes the
     // device's buffers, so re-asserting an already-set run bit would inherit the previous run.
     let mut rx = dev.start(Stream::Samples, &Acquisition::default())?;

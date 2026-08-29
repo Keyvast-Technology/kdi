@@ -14,7 +14,7 @@ members = ["kdi"]
 # The crate asserts at COMPILE TIME that this equals the
 # generated KDI_VERSION, so a publish cannot ship a crate that disagrees with the contract it
 # claims to implement.
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # The toolchain these crates are ACTUALLY built and tested with (`rust-toolchain.toml` pins the
 # same). It was 1.75 and that was a promise nothing checked — the comment here said so in as many

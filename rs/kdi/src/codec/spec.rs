@@ -13,13 +13,13 @@
 /// The contract version this crate implements, `major.minor`. The crate's own version is this plus
 /// a patch component and nothing else, asserted at COMPILE TIME — so a published crate cannot
 /// disagree with the contract it claims to implement.
-pub const KDI_VERSION: &str = "0.4";
+pub const KDI_VERSION: &str = "0.5";
 /// The contract MAJOR. A device announcing a different one must be refused at bind: majors are not
 /// compatible, and the traffic that would follow cannot be trusted.
 pub const KDI_MAJOR: u16 = 0;
 /// The contract MINOR. ADDITIVE by definition — a device on a HIGHER minor binds normally, and a
 /// host must never do version arithmetic beyond the major equality test.
-pub const KDI_MINOR: u16 = 4;
+pub const KDI_MINOR: u16 = 5;
 /// Every frame carries the contract's MINOR in `contract_rev`. Derived here rather
 /// than restated, which is the whole point: it was once a literal in three places
 /// at once and a contract bump left all three reading the old revision.

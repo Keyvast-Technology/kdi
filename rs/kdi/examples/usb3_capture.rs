@@ -60,6 +60,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // EVERY HOST OWES THIS WRITE (#131, contract 0.5). An unconfigured device emits nothing on
+    // `rhd_matrix`, and before the capability existed it emitted one frame per twenty sample
+    // periods while declaring the full cadence. Non-fatal, so this still runs against pre-0.5
+    // gateware, where the rate is whatever the last host left.
+    if let Err(e) = dev.set_rate(42, 25) {
+        eprintln!("note: rate not configured ({e}) - pre-0.5 gateware");
+    }
 
     let (major, minor) = dev.kdi();
     println!("gateware_sha    {:08x}", dev.gateware_sha());

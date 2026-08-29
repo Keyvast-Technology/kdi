@@ -13,13 +13,13 @@
 /// The contract THIS HOST implements — the `host` half of a `Skew::Major` and the
 /// only version a caller may compare its own expectations against. The DEVICE's is
 /// `Device::kdi()`, read off the wire at bind.
-pub const KDI_VERSION: &str = "0.4";
+pub const KDI_VERSION: &str = "0.5";
 /// The contract MAJOR. A device announcing a different one must be refused at bind: majors are not
 /// compatible, and the traffic that would follow cannot be trusted.
 pub const KDI_MAJOR: u16 = 0;
 /// The contract MINOR. ADDITIVE by definition — a device on a HIGHER minor binds normally, and a
 /// host must never do version arithmetic beyond the major equality test.
-pub const KDI_MINOR: u16 = 4;
+pub const KDI_MINOR: u16 = 5;
 /// Every frame carries the contract's MINOR in `contract_rev`.
 pub const CONTRACT_REV: u16 = KDI_MINOR;
 /// How long a host must be willing to poll `contract_ready` before giving up, in milliseconds. A
@@ -154,7 +154,7 @@ impl Kind {
 pub enum Cap {
     /// this build emits the format-2 self-describing frame on the declared stream endpoints
     ///
-    /// Gates: streams `samples`, `digital`; registers `run_samples`, `run_digital`,
+    /// Gates: streams `samples`, `digital`; registers `quiesce`, `run_samples`, `run_digital`,
     /// `lanes_samples`, `burst_samples`, `burst_digital`, `stream_status_samples`,
     /// `stream_status_digital`.
     CleanFrame,
@@ -162,8 +162,8 @@ pub enum Cap {
     /// the typed request/response command channel is live (firmware-dependent: it is baked into the
     /// same .bit)
     ///
-    /// Gates: commands `sys.hello`, `power.status`, `power.up`, `adio.mode`, `adio.adc`,
-    /// `gnd.eeprom.read`, `sys.claim`, `sys.release`, `sys.challenge`, `sys.unlock`.
+    /// Gates: commands `sys.hello`, `power.status`, `power.up`, `adio.mode`, `adio.adc`, `adio.fb`,
+    /// `adio.dout`, `gnd.eeprom.read`, `sys.claim`, `sys.release`, `sys.challenge`, `sys.unlock`.
     CommandProtocol,
 
     /// the DDR3 pipe buffer is present and calibrated; without it a stream's depth is the on-chip
@@ -172,7 +172,7 @@ pub enum Cap {
 
     /// ADIO analog/digital module I/O is present
     ///
-    /// Gates: commands `adio.mode`, `adio.adc`.
+    /// Gates: commands `adio.mode`, `adio.adc`, `adio.fb`, `adio.dout`.
     Adio,
 
     /// the grounding/module-ID board is present
@@ -191,6 +191,14 @@ pub enum Cap {
     /// gateware images can be written over the wire and selected at boot (RESERVED — no command
     /// implements this yet)
     FieldUpdate,
+
+    /// the acquisition rate is host-configurable, and `rhd_matrix` emits NOTHING until it has been
+    /// configured (#131). A device with this capability expects `rate_md` + `rate_apply` before
+    /// acquisition and reports readiness on `rate_ready`; without it a host cannot know whether the
+    /// cadence a frame declares is one the hardware was placed into.
+    ///
+    /// Gates: registers `rate_md`, `rate_apply`, `rate_ready`.
+    RateControl,
 }
 
 impl Cap {
@@ -205,6 +213,7 @@ impl Cap {
             Cap::TtlIn => "ttl_in",
             Cap::SlotHealth => "slot_health",
             Cap::FieldUpdate => "field_update",
+            Cap::RateControl => "rate_control",
         }
     }
 
@@ -220,6 +229,7 @@ impl Cap {
             "ttl_in" => Cap::TtlIn,
             "slot_health" => Cap::SlotHealth,
             "field_update" => Cap::FieldUpdate,
+            "rate_control" => Cap::RateControl,
             _ => return None,
         })
     }
@@ -235,6 +245,7 @@ impl Cap {
             Cap::TtlIn => 5,
             Cap::SlotHealth => 6,
             Cap::FieldUpdate => 7,
+            Cap::RateControl => 8,
         }
     }
 }
@@ -408,6 +419,7 @@ pub(crate) const USB3_REG: &[(&str, &str, u8, Option<u8>, u8)] = &[
     ("caps", "wireout", 0x36, None, 32),
     ("gateware_sha", "wireout", 0x37, None, 32),
     ("contract_ready", "wireout", 0x31, Some(1), 1),
+    ("quiesce", "wirein", 0x00, Some(0), 1),
     ("run_samples", "wirein", 0x11, Some(1), 1),
     ("run_digital", "wirein", 0x11, Some(0), 1),
     ("lanes_samples", "wirein", 0x12, None, 32),
@@ -418,6 +430,9 @@ pub(crate) const USB3_REG: &[(&str, &str, u8, Option<u8>, u8)] = &[
     ("occupancy", "wireout", 0x20, None, 32),
     ("overflow", "wireout", 0x31, Some(0), 1),
     ("console_tx_drop", "wireout", 0x31, Some(2), 1),
+    ("rate_md", "wirein", 0x03, None, 32),
+    ("rate_apply", "triggerin", 0x40, Some(0), 1),
+    ("rate_ready", "wireout", 0x3B, Some(0), 1),
 ];
 
 /// Which registers control which stream, from `streams.*.registers`:

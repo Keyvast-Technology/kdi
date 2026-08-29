@@ -44,6 +44,8 @@ pub const COMMANDS: &[(&str, &[&str])] = &[
     ("power.status", &[]),
     ("power.up", &[]),
     ("adio.mode", &["slot", "ch1", "ch2"]),
+    ("adio.fb", &["slot", "on"]),
+    ("adio.dout", &["slot", "mask"]),
     ("adio.adc", &["slot", "ch", "n"]),
 ];
 
@@ -199,6 +201,59 @@ impl AdioMode {
     }
 }
 
+/// The reply to `adio.fb`.
+///
+/// Cross-channel loopback tie. Independent of either channel's DIRECTION and of CH_MODE, and re-
+/// asserted with the expander, so setting a mode never silently drops a tie. The muxes make it a
+/// SELECT, not a strap: with the tie on, a channel routes to the other channel instead of to its
+/// jack.
+#[derive(Clone, Debug)]
+pub struct AdioFb {
+    /// The reply's `slot` value — declared `u8`.
+    pub slot: u8,
+
+    /// The reply's `fb` value — declared `u8`.
+    pub fb: u8,
+}
+
+impl AdioFb {
+    fn parse(r: &Reply) -> Result<Self, Error> {
+        Ok(Self {
+            slot: uint(r, "slot")?,
+            fb: uint(r, "fb")?,
+        })
+    }
+}
+
+/// The reply to `adio.dout`.
+///
+/// Drive the digital outputs (bit0 CH1, bit1 CH2) and echo the RAW pad readback, so one call is
+/// both a stimulus and its measurement. A non-zero mask is refused on an absent slot: driving a pin
+/// high there back-powers the module rail. Note the pin only moves if that channel's CH_MODE is
+/// out, and a driven channel reads 0 on its own TTL lane by design -- read the OTHER channel,
+/// through the tie.
+#[derive(Clone, Debug)]
+pub struct AdioDout {
+    /// The reply's `slot` value — declared `u8`.
+    pub slot: u8,
+
+    /// The reply's `dout` value — declared `u8`.
+    pub dout: u8,
+
+    /// The reply's `din` value — declared `u8`.
+    pub din: u8,
+}
+
+impl AdioDout {
+    fn parse(r: &Reply) -> Result<Self, Error> {
+        Ok(Self {
+            slot: uint(r, "slot")?,
+            dout: uint(r, "dout")?,
+            din: uint(r, "din")?,
+        })
+    }
+}
+
 /// The reply to `adio.adc`.
 ///
 /// n is range-checked, never silently clamped (the human `kv adio adc` clamps). valid\[i\] mirrors
@@ -247,6 +302,19 @@ pub trait Commands {
     /// Set a slot's two channel modes (I2C mux + CH_MODE, kept coherent).
     fn adio_mode(&mut self, slot: u8, ch1: ChMode, ch2: ChMode) -> Result<AdioMode, Error>;
 
+    /// Cross-channel loopback tie. Independent of either channel's DIRECTION and of CH_MODE, and
+    /// re-asserted with the expander, so setting a mode never silently drops a tie. The muxes make
+    /// it a SELECT, not a strap: with the tie on, a channel routes to the other channel instead of
+    /// to its jack.
+    fn adio_fb(&mut self, slot: u8, on: u8) -> Result<AdioFb, Error>;
+
+    /// Drive the digital outputs (bit0 CH1, bit1 CH2) and echo the RAW pad readback, so one call is
+    /// both a stimulus and its measurement. A non-zero mask is refused on an absent slot: driving a
+    /// pin high there back-powers the module rail. Note the pin only moves if that channel's
+    /// CH_MODE is out, and a driven channel reads 0 on its own TTL lane by design -- read the OTHER
+    /// channel, through the tie.
+    fn adio_dout(&mut self, slot: u8, mask: u8) -> Result<AdioDout, Error>;
+
     /// n is range-checked, never silently clamped (the human `kv adio adc` clamps). valid\[i\]
     /// mirrors each sample's valid bit — a code with valid=false is meaningless.
     fn adio_adc(&mut self, slot: u8, ch: u8, n: Option<u8>) -> Result<AdioAdc, Error>;
@@ -280,6 +348,32 @@ impl Commands for Device {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let reply = checked(self.raw_cmd("adio.mode", &args)?)?;
         AdioMode::parse(&reply)
+    }
+
+    fn adio_fb(&mut self, slot: u8, on: u8) -> Result<AdioFb, Error> {
+        if slot > 7 {
+            return Err(Error::Host(HostErr::HostUnsafeArg));
+        }
+        if on > 1 {
+            return Err(Error::Host(HostErr::HostUnsafeArg));
+        }
+        let args: Vec<String> = vec![slot.to_string(), on.to_string()];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let reply = checked(self.raw_cmd("adio.fb", &args)?)?;
+        AdioFb::parse(&reply)
+    }
+
+    fn adio_dout(&mut self, slot: u8, mask: u8) -> Result<AdioDout, Error> {
+        if slot > 7 {
+            return Err(Error::Host(HostErr::HostUnsafeArg));
+        }
+        if mask > 3 {
+            return Err(Error::Host(HostErr::HostUnsafeArg));
+        }
+        let args: Vec<String> = vec![slot.to_string(), mask.to_string()];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let reply = checked(self.raw_cmd("adio.dout", &args)?)?;
+        AdioDout::parse(&reply)
     }
 
     fn adio_adc(&mut self, slot: u8, ch: u8, n: Option<u8>) -> Result<AdioAdc, Error> {

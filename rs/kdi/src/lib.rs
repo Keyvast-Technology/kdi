@@ -360,6 +360,10 @@ fn mint_token() -> String {
     format!("host-{}-{entropy:x}", std::process::id())
 }
 
+/// How many times [`Device::set_rate`] programs before giving up. More than one because the first
+/// DRP burst after configuration is not reliably applied on current gateware (#131).
+const RATE_APPLY_TRIES: u32 = 4;
+
 /// A bound device. Holds the link, the identity it was opened as, the capability word read at
 /// bind, the lease token minted for this session, and a shadow of every WireIn word this host has
 /// written (`Device::write_field`, private — the shadow is why an unmasked field write cannot
@@ -681,6 +685,15 @@ impl Device {
     /// Dropping a `Device` without calling this closes the transport just the same; what it skips
     /// is the release, so the board stays claimed until its lease expires.
     pub fn close(mut self) -> Result<(), Error> {
+        // QUIESCE FIRST. The instrument is single-owner and its acquisition state outlives the
+        // process that set it, so a host that just exits hands the next one a running engine and
+        // full pipes. Measured: a host opening after that received one record per twenty sample
+        // periods with the sticky overrun CLEAR -- valid frames, monotonic stamps, 95 % of the data
+        // gone, and nothing in the published surface able to see it. Leaving it running is not a
+        // neutral act, so closing cleans up whether or not the caller remembered to.
+        //
+        // Best effort, like the release below: a device that has stopped answering is already gone.
+        let _ = self.quiesce();
         // BEST EFFORT, and its failure may not mask a close error (`kdi/client.py:335-340` puts
         // the release in the `try` and the transport teardown in the `finally`). A device that
         // stopped answering is already gone; holding the lease open on it is not a thing this
@@ -692,6 +705,71 @@ impl Device {
         // their own Drop, so there is nothing more this can report that dropping does not do.
         drop(self);
         Ok(())
+    }
+
+    /// Return acquisition to a defined state: flush both streams, disarm any other consumer, stop
+    /// the engine.
+    ///
+    /// Call it on the way IN if you may have inherited a dirty instrument, and know that
+    /// [`Device::close`] already calls it on the way out. Without it a host has no way to escape
+    /// what a previous application left behind, and no way to detect that it has not: the symptom
+    /// is well-formed frames arriving far too slowly, with the sticky overrun clear.
+    ///
+    /// **It returns the device to UNCONFIGURED** (contract 0.5): the rate register reverts to the
+    /// default and `rate_ready` clears with it, so `rhd_matrix` emits nothing until
+    /// [`Device::set_rate`] is called again. The pulse is masked, so it does not disturb the
+    /// register's other fields.
+    pub fn quiesce(&mut self) -> Result<(), Error> {
+        self.write_field("quiesce", 1)?;
+        self.write_field("quiesce", 0)
+    }
+
+    /// Is the acquisition rate configured, so `rhd_matrix` may emit?
+    ///
+    /// False from power-up on a device that advertises [`Cap::RateControl`]. See [`set_rate`].
+    ///
+    /// [`set_rate`]: Device::set_rate
+    pub fn rate_ready(&mut self) -> Result<bool, Error> {
+        Ok(self.read_reg("rate_ready")? & 1 != 0)
+    }
+
+    /// Configure the acquisition rate, and VERIFY it took.
+    ///
+    /// `m`/`d` are the MMCM feedback pair the device's rate table is keyed on. Passing `0, 0`
+    /// selects the device default, which is a legitimate choice: what matters is not WHICH rate is
+    /// chosen but that one was applied. Until it is, the device emits one frame per twenty sample
+    /// periods while its header declares the full cadence (#131) — measured, and unrelated to
+    /// transport, which loses nothing.
+    ///
+    /// This POLLS `rate_ready` and re-applies rather than assuming the write took.
+    ///
+    /// Returns `Io(TimedOut)` if the device never reports ready.
+    pub fn set_rate(&mut self, m: u8, d: u8) -> Result<(), Error> {
+        if !self.caps().has(Cap::RateControl) {
+            // Older gateware has no gate and no readback: the rate is whatever it is, and saying so
+            // is better than looping on a register that does not exist.
+            return Err(io_err(
+                io::ErrorKind::Unsupported,
+                "this device does not advertise rate_control; its rate cannot be configured or verified",
+            ));
+        }
+        let md = (u32::from(m) << 8) | u32::from(d);
+        // Program at least once even if `rate_ready` already reads set: the caller asked for a
+        // SPECIFIC rate, and a flag someone else's write left behind says nothing about which.
+        for _ in 0..RATE_APPLY_TRIES {
+            self.write_field("rate_md", md)?;
+            self.write_field("rate_apply", 1)?;
+            std::thread::sleep(Duration::from_millis(20));
+            if self.rate_ready()? {
+                return Ok(());
+            }
+        }
+        Err(io_err(
+            io::ErrorKind::TimedOut,
+            format!(
+                "rate_ready stayed clear after {RATE_APPLY_TRIES} attempts to program the rate"
+            ),
+        ))
     }
 
     fn read_reg(&mut self, name: &str) -> Result<u32, Error> {
@@ -894,7 +972,7 @@ pub struct Caps(pub u32);
 /// HAND-WRITTEN, because the generated `spec.rs` publishes no `ALL` array and no `Cap::from_bit`
 /// (reported as a generator gap). `caps_list_is_complete` below is an exhaustive match, so adding
 /// a capability to the contract stops this crate compiling until a human extends the list.
-const ALL_CAPS: [Cap; 8] = [
+const ALL_CAPS: [Cap; 9] = [
     Cap::CleanFrame,
     Cap::CommandProtocol,
     Cap::Ddr3,
@@ -903,6 +981,7 @@ const ALL_CAPS: [Cap; 8] = [
     Cap::TtlIn,
     Cap::SlotHealth,
     Cap::FieldUpdate,
+    Cap::RateControl,
 ];
 
 impl Caps {
@@ -1210,7 +1289,8 @@ mod tests {
                 | Cap::Grounding
                 | Cap::TtlIn
                 | Cap::SlotHealth
-                | Cap::FieldUpdate => {}
+                | Cap::FieldUpdate
+                | Cap::RateControl => {}
             }
         }
         assert!(ALL_CAPS.windows(2).all(|w| w[0].bit() < w[1].bit()));

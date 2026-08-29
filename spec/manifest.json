@@ -1,6 +1,6 @@
 {
   "schema": "keyvast.instrument/1",
-  "kdi": "0.4",
+  "kdi": "0.5",
   "compatible": "keyvast-a75",
   "gateware": {
     "git_sha": "software",
@@ -10,8 +10,8 @@
   "artifacts": [
     {
       "name": "descriptor.json",
-      "size": 51683,
-      "checksum": "sha256:b0f6f24c014725d19834c61bb02aa81ba9dd3a6432e63efbf543761009956f82"
+      "size": 54752,
+      "checksum": "sha256:39832000d1c0b1c28d7cd072568449673533b93c540b367ff336bbcdbf77c5b7"
     },
     {
       "name": "schema.json",
@@ -26,5 +26,5 @@
     "target": "software-reference",
     "note": "kdi.conform against the software device; NOT a gateware result"
   },
-  "kdi_release": "0.4.0"
+  "kdi_release": "0.5.0"
 }

@@ -1,5 +1,5 @@
 {
-  "kdi": "0.4",
+  "kdi": "0.5",
   "device": {
     "vendor": "keyvast",
     "type": "a75",
@@ -14,7 +14,8 @@
     "4": "grounding",
     "5": "ttl_in",
     "6": "slot_health",
-    "7": "field_update"
+    "7": "field_update",
+    "8": "rate_control"
   },
   "cap_gates": {
     "clean_frame": {
@@ -24,6 +25,7 @@
         "digital"
       ],
       "registers": [
+        "quiesce",
         "run_samples",
         "run_digital",
         "lanes_samples",
@@ -41,6 +43,8 @@
         "power.up",
         "adio.mode",
         "adio.adc",
+        "adio.fb",
+        "adio.dout",
         "gnd.eeprom.read",
         "sys.claim",
         "sys.release",
@@ -55,7 +59,9 @@
       "doc": "ADIO analog/digital module I/O is present",
       "commands": [
         "adio.mode",
-        "adio.adc"
+        "adio.adc",
+        "adio.fb",
+        "adio.dout"
       ]
     },
     "grounding": {
@@ -66,6 +72,14 @@
     },
     "ttl_in": {
       "doc": "TTL inputs are wired to the digital stream's lanes"
+    },
+    "rate_control": {
+      "doc": "the acquisition rate is host-configurable, and `rhd_matrix` emits NOTHING until it has been configured (#131). A device with this capability expects `rate_md` + `rate_apply` before acquisition and reports readiness on `rate_ready`; without it a host cannot know whether the cadence a frame declares is one the hardware was placed into.\n",
+      "registers": [
+        "rate_md",
+        "rate_apply",
+        "rate_ready"
+      ]
     },
     "slot_health": {
       "doc": "per-slot presence and rail health are readable",
@@ -172,6 +186,26 @@
     }
   ],
   "fastpath_registers": [
+    {
+      "name": "rate_md",
+      "access": "rw",
+      "doc": "[15:8] M, [7:0] D -- the MMCM feedback pair that selects the sample rate"
+    },
+    {
+      "name": "rate_apply",
+      "access": "wo",
+      "doc": "0->1 programs the MMCM from rate_md. Poll rate_ready; re-apply if it stays 0"
+    },
+    {
+      "name": "rate_ready",
+      "access": "ro",
+      "doc": "[0] the rate was configured by a host and rhd_matrix may emit. 0 = unconfigured, and the stream is silent by design"
+    },
+    {
+      "name": "quiesce",
+      "access": "rw",
+      "doc": "1 then 0 = flush both streams, disarm consumers, stop the engine. Reverts the sample rate register and returns the device to UNCONFIGURED (see #131)."
+    },
     {
       "name": "run_samples",
       "access": "rw",
@@ -410,7 +444,7 @@
               "type": "u1"
             }
           ],
-          "doc": "ADIO digital INPUT levels, one lane per physical line, bit-packed: 16 lines cost one word and every bit is named by its own lane id, so no host needs a slot->bit formula. LEVELS, not edges: each row is the pin level sampled once per row, so a pulse shorter than one row period can be missed entirely and an edge is located only to +-1 row. SAMPLE INSTANT: the level is latched at FRAME START, so it belongs to the frame's own timestamp instant (keyvast-fpga #76, fixed). Derived from RTL and sim, NOT yet bench-measured. The residual error is the pin-to-latch synchroniser delay, which is a hardware measurement that has not been made \u2014 do not assume a tolerance. Note this is the SAMPLE instant, not an edge time: levels are still sampled once per row, so a pulse shorter than one row period can be missed and an edge is located only to +-1 row.\n"
+          "doc": "ADIO digital INPUT levels, one lane per physical line, bit-packed: 16 lines cost one word and every bit is named by its own lane id, so no host needs a slot->bit formula. LEVELS, not edges: each row is the pin level sampled once per row, so a pulse shorter than one row period can be missed entirely and an edge is located only to +-1 row. SAMPLE INSTANT: the level is latched at FRAME START, so it belongs to the frame's own timestamp instant (fixed). Derived from RTL and sim, NOT yet bench-measured. The residual error is the pin-to-latch synchroniser delay, which is a hardware measurement that has not been made \u2014 do not assume a tolerance. Note this is the SAMPLE instant, not an edge time: levels are still sampled once per row, so a pulse shorter than one row period can be missed and an edge is located only to +-1 row.\n"
         },
         {
           "code": 32,
@@ -771,7 +805,7 @@
               "type": "u1"
             }
           ],
-          "doc": "ADIO digital INPUT levels, one bit-packed lane per physical line: 16 lines cost ONE word and every bit is named by its own lane id, so no host needs a slot-to-bit formula. The level is latched at FRAME START, so it belongs to its own frame's timestamp instant (keyvast-fpga #76, fixed). LEVELS, not edges: a pulse shorter than one sample period can be missed and an edge is located only to +-1 sample.\n"
+          "doc": "ADIO digital INPUT levels, one bit-packed lane per physical line: 16 lines cost ONE word and every bit is named by its own lane id, so no host needs a slot-to-bit formula. The level is latched at FRAME START, so it belongs to its own frame's timestamp instant (fixed). LEVELS, not edges: a pulse shorter than one sample period can be missed and an edge is located only to +-1 sample.\n"
         }
       ],
       "stream_id_blocks": [
@@ -1006,6 +1040,7 @@
         "caps": "wireout:0x36",
         "gateware_sha": "wireout:0x37",
         "contract_ready": "wireout:0x31.1",
+        "quiesce": "wirein:0x00.0",
         "run_samples": "wirein:0x11.1",
         "run_digital": "wirein:0x11.0",
         "lanes_samples": "wirein:0x12",
@@ -1015,7 +1050,10 @@
         "stream_status_digital": "wireout:0x38",
         "occupancy": "wireout:0x20",
         "overflow": "wireout:0x31.0",
-        "console_tx_drop": "wireout:0x31.2"
+        "console_tx_drop": "wireout:0x31.2",
+        "rate_md": "wirein:0x03",
+        "rate_apply": "triggerin:0x40.0",
+        "rate_ready": "wireout:0x3b.0"
       },
       "stream": {
         "samples": "okPipeOut:0xa3",
@@ -1208,6 +1246,61 @@
         "no_ip"
       ],
       "doc": "Set a slot's two channel modes (I2C mux + CH_MODE, kept coherent)."
+    },
+    {
+      "name": "adio.fb",
+      "tier": "public",
+      "safety": "attended",
+      "args": [
+        {
+          "name": "slot",
+          "type": "u8",
+          "max": 7
+        },
+        {
+          "name": "on",
+          "type": "u8",
+          "max": 1
+        }
+      ],
+      "returns": {
+        "slot": "u8",
+        "fb": "u8"
+      },
+      "errors": [
+        "bad_args",
+        "not_present",
+        "no_ip"
+      ],
+      "doc": "Cross-channel loopback tie. Independent of either channel's DIRECTION and of CH_MODE, and re-asserted with the expander, so setting a mode never silently drops a tie. The muxes make it a SELECT, not a strap: with the tie on, a channel routes to the other channel instead of to its jack.\n"
+    },
+    {
+      "name": "adio.dout",
+      "tier": "public",
+      "safety": "attended",
+      "args": [
+        {
+          "name": "slot",
+          "type": "u8",
+          "max": 7
+        },
+        {
+          "name": "mask",
+          "type": "u8",
+          "max": 3
+        }
+      ],
+      "returns": {
+        "slot": "u8",
+        "dout": "u8",
+        "din": "u8"
+      },
+      "errors": [
+        "bad_args",
+        "not_present",
+        "no_ip"
+      ],
+      "doc": "Drive the digital outputs (bit0 CH1, bit1 CH2) and echo the RAW pad readback, so one call is both a stimulus and its measurement. A non-zero mask is refused on an absent slot: driving a pin high there back-powers the module rail. Note the pin only moves if that channel's CH_MODE is out, and a driven channel reads 0 on its own TTL lane by design -- read the OTHER channel, through the tie.\n"
     },
     {
       "name": "adio.adc",
