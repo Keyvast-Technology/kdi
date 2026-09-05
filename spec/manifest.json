@@ -3,7 +3,7 @@
   "kdi": "0.5",
   "compatible": "keyvast-a75",
   "gateware": {
-    "git_sha": "015143f",
+    "git_sha": "ffd4684",
     "build_unix": 0,
     "dirty": false,
     "note": "software reference + usb3 binding (see the compatibility matrix)"

@@ -1,0 +1,7 @@
+# Pinned, and scoped to kdi/rs/ so sw/rust's firmware builds are untouched. Without a pin the
+# first CI failure is unreproducible — the repo pins every other toolchain by digest
+# (Makefile's tag@sha256 images), and this was the one that had none.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
