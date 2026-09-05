@@ -16,7 +16,7 @@ Three artifacts on three schedules, so a tag says what actually moved:
 |---|---|---|
 | `spec-v0.4.0` | the contract bundle — descriptor, schema, vectors, manifest | the **wire format** moves. Rarely, and deliberately |
 | `gateware-v0.9.0` | a bitstream to flash, with the `gateware_sha` the board will report | a build is worth shipping to instruments |
-| [`kdi` on crates.io](https://crates.io/crates/kdi) | the Rust host library | the SDK changes |
+| `v0.5.0` → [`kdi` on crates.io](https://crates.io/crates/kdi) | the Rust host library | the SDK changes. The tag is what publishes it |
 
 One contract version outlives many gateware builds, which is why they are not cut together: a
 contract release means the wire format changed, and saying that when it has not is worse than
