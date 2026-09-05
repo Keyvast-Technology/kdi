@@ -1,31 +1,6 @@
-//! One bounded, GUI-free answer to "is this instrument acquiring normally?"
-//!
-//! ```text
-//! cargo run --features usb3 --example health -- [serial] [--expect-sha HEX] [--slot N]
-//! ```
-//!
-//! Five claims, each falsifiable on its own, each naming what it would blame:
-//!
-//! 1. **identity**  — which gateware is running (`--expect-sha` turns this into a gate)
-//! 2. **ready**     — the device reports itself ready; the power tree is readable
-//! 3. **transport** — frames arrive well-formed: CRC, monotonic timestamps, no overrun
-//! 4. **stimulus**  — a DRIVEN edge appears on the lane that should carry it
-//! 5. **analogue**  — the amplifier stream delivers, with per-row spread reported
-//!
-//! Claim 4 is the one that matters and the one usually skipped. Frames arriving with valid
-//! CRC prove the PIPE, not the front end: a disconnected, mis-muxed or floating input
-//! produces a perfectly healthy-looking stream. So this drives a level through the module's
-//! own cross-channel tie and asserts the other channel's lane follows it. Nothing else here
-//! can fail when the front end is dead.
-//!
-//! It reads the pad through `adio.dout`'s echoed `din` rather than the digital stream,
-//! because that is the RAW readback: a driven channel exports 0 on its own TTL lane by
-//! design, so a lane-based check of the driven side would assert the wrong thing.
-//!
-//! **It drives a pin.** That is refused on an absent slot by the device, but it is still a
-//! state change on a shared instrument: this is not a passive monitor. It restores the
-//! slot to both-inputs before exiting, never to `off`, because `off` reads 0 on the TTL
-//! lanes and would leave the digital-in path silently dead.
+//! One bounded, GUI-free "is this instrument acquiring normally?": `health [serial] [--expect-sha
+//! HEX] [--slot N]`, five falsifiable claims. **It DRIVES A PIN**: a state change on a shared
+//! instrument. Claim 4 is the point — valid CRC proves the PIPE, not a dead or floating front end.
 
 use kdi::{Acquisition, ChMode, Commands, Stream};
 use std::time::Duration;
@@ -93,13 +68,9 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // AFTER the quiesce, never before: quiesce deliberately returns the device to UNCONFIGURED
-    // (contract 0.5), so a rate programmed ahead of it is undone. Ordering these the other way
-    // round leaves the analogue check reporting "rate is not configured" from a host that did
-    // configure it -- which is what this example did on its first run against 0.5 gateware.
-    //
-    // Non-fatal, so this still runs against pre-0.5 gateware where the rate is whatever the last
-    // host left.
+    // AFTER the quiesce, never before: quiesce returns the device to UNCONFIGURED (contract 0.5),
+    // so a rate set ahead of it is undone and the analogue check reports "rate is not configured"
+    // from a host that did configure it. Non-fatal, so pre-0.5 gateware still runs.
     if let Err(e) = dev.set_rate(42, 25) {
         eprintln!("note: rate not configured ({e}) - pre-0.5 gateware");
     }
@@ -192,8 +163,8 @@ fn main() -> std::process::ExitCode {
     }
 
     // 4. stimulus ---------------------------------------------------------------
-    // CH1 drives, CH2 reads, tied through the module. Both edges, so a stuck-high pad
-    // fails as loudly as a dead one.
+    // CH1 drives, CH2 reads through the module tie, both edges. Read via `adio.dout`'s echoed
+    // `din`: a driven channel exports 0 on its own TTL lane, so a lane-based check would be wrong.
     let mut stim = String::new();
     let mut stim_ok = present & (1 << slot) != 0;
     if !stim_ok {

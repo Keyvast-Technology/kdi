@@ -1,30 +1,10 @@
 //! The USB3 device driver this crate ships, its provenance, and the staging that makes it loadable.
-//!
-//! **`--features bundled` compiles the target platform's driver into the artifact**, so a build
-//! runs on a machine with no driver installed. There is one bitstream in this repository's
-//! release process (`make all` / the GitHub release asset). This crate does not carry a second
-//! copy: [`crate::Device::open_usb3_configured`] takes the image the caller already has.
-//!
-//! The bytes are here in the source either way, because Cargo packages a crate's whole source
-//! directory. [`VENDORED`] is compiled UNCONDITIONALLY, feature or not. `tests/provenance.rs`
-//! hashes the files on disk against that table, so swapping a blob without updating its record
-//! fails the build's tests.
-//!
-//! Two things are deliberate and would be wrong to "fix":
-//!
-//! * **The files are `vendor/driver-<arch>-<os>.bin`, not anyone else's file names.** What a
-//!   customer browsing the source or a package listing sees is ours. This is white-labelling, not
-//!   concealment — see `usb3.rs`, which resolves the driver's exported symbols by `dlsym` and
-//!   therefore contains their real names as plain string literals on purpose.
-//! * **A platform with no vendored driver is a COMPILE ERROR**, named below. A silent fallback to
-//!   "search the machine" would make `bundled` mean something different per platform, and the
-//!   difference would only show up on a customer's machine.
+//! `--features bundled` compiles the target platform's driver into the artifact; the bytes are in
+//! this source either way (Cargo packages it all), and `tests/provenance.rs` hashes them.
 
-/// Where one vendored blob came from, and what it must still be.
-///
-/// Provenance for a binary that ships inside a public crate: "some file that was on a PC" is not
-/// good enough, and neither is a claim stronger than what was actually recorded — see the driver's
-/// [`Vendored::note`].
+/// Where one vendored blob came from, and what it must still be. Provenance for a binary shipped
+/// inside a public crate: "some file that was on a PC" is not good enough, and neither is a claim
+/// stronger than what was actually recorded — see [`Vendored::note`].
 #[derive(Debug)]
 pub struct Vendored {
     /// Path within this crate, relative to its manifest directory.
@@ -39,26 +19,17 @@ pub struct Vendored {
     pub note: &'static str,
 }
 
-/// The one release every vendored driver was extracted from.
-///
-/// A single archived source is the point: the drivers are no longer "a file that happened to be on
-/// a machine", they are an artifact of a release this organisation archives and can re-fetch, and
-/// each row's SHA-256 says which bytes came out of it. That is what a blob inside a published
-/// crate needs in order to be auditable by the person receiving it.
-///
-/// It does not name the board's maker, per the white-labelling rule that
-/// `tests/vendor_neutral.rs` enforces — a customer meets our provenance, not theirs. The upstream
-/// coordinates are not secret, merely not published here: they are recorded in this repository's
-/// `the project's engineering notes`, which does not ship.
+/// The one release every vendored driver was extracted from: a single archived source this
+/// organisation can re-fetch, each row's SHA-256 saying which bytes came out of it. It does not
+/// name the board's maker (white-labelling, `tests/vendor_neutral.rs`); coordinates are internal.
 const RELEASE: &str = "host API release 6.0.0 (2026-07-21), archived in this organisation's \
                        private hardware-support repository";
 
 /// Every binary blob in this crate's source, with its provenance. See [`Vendored`].
 pub const VENDORED: &[Vendored] = &[
-    // The four drivers all come from ONE release we control, and each row's sha256 is the file as
-    // extracted from that release's tarball for its platform. The Windows row additionally records
-    // that the copy running on the bench is byte-identical to it — which is what lets a bench
-    // result stand for the vendored blob rather than merely resembling it.
+    // The four drivers all come from ONE release we control, and each sha256 is the file as
+    // extracted from that release's tarball. The Windows row also records that the copy on the
+    // bench is byte-identical, which is what lets a bench result stand for the vendored blob.
     Vendored {
         file: "vendor/driver-x86_64-windows.bin",
         source: RELEASE,
@@ -67,13 +38,9 @@ pub const VENDORED: &[Vendored] = &[
         note: "verified byte-identical to the copy installed on the instrument bench, so the \
                hardware results recorded against that machine are results for THIS blob",
     },
-    // The release offers SEVERAL Linux builds and this is the oldest-glibc one ON PURPOSE, because
-    // a glibc floor is a compatibility CEILING: a library runs on any system at or above the
-    // version it was built against and on none below it. Measured, not assumed — the newest build
-    // needs GLIBC_2.38, which excludes Ubuntu 22.04, Debian 12 and RHEL/Rocky 9, all current and
-    // all plausible instrument hosts; this one needs 2.34 and clears every one of them at the same
-    // size. Re-measure before taking a newer build: read the `GLIBC_*` tags out of the blob and
-    // take the maximum.
+    // The oldest-glibc Linux build ON PURPOSE: a glibc floor is a compatibility CEILING.
+    // Measured: the newest needs GLIBC_2.38, excluding Ubuntu 22.04, Debian 12 and RHEL 9; this
+    // one needs 2.34, same size. Re-measure a newer build: max of the blob's `GLIBC_*` tags.
     Vendored {
         file: "vendor/driver-x86_64-linux.bin",
         source: RELEASE,
@@ -83,10 +50,9 @@ pub const VENDORED: &[Vendored] = &[
                musl system (Alpine) cannot load it. NOT exercised against a board — the bench \
                workstation is Windows",
     },
-    // aarch64 Linux, for ARM acquisition hosts (single-board machines, ARM servers). Upstream ships
-    // it as a Raspbian 12 build, but the LIBRARY's floor is what binds, not the distribution it was
-    // built on: it needs glibc 2.34, the same as the x86_64 row above, so it reaches every ARM
-    // distribution that one reaches on Intel rather than being narrowed to Debian 12 and newer.
+    // aarch64 Linux, for ARM acquisition hosts. Upstream builds it on Raspbian 12, but the
+    // LIBRARY's floor is what binds: glibc 2.34, the same as x86_64 above, so it reaches every
+    // ARM distribution x86_64 reaches, not just Debian 12 and newer.
     Vendored {
         file: "vendor/driver-aarch64-linux.bin",
         source: RELEASE,
@@ -95,11 +61,9 @@ pub const VENDORED: &[Vendored] = &[
         note: "needs glibc >= 2.34 and libudev at run time; glibc-only, so a musl system (Alpine) \
                cannot load it. NOT exercised against a board",
     },
-    // macOS ships ONE fat library and this row is its arm64 slice, carved out so the target embeds
-    // only its own architecture. The Intel slice was vendored too and is no longer: Apple stopped
-    // selling Intel Macs, and every blob here is a redistribution obligation and an audit surface
-    // shipped to EVERY consumer, not only to the platform that can use it. An Intel Mac can still
-    // use this crate -- it loads a driver from disk; only `--features bundled` is unavailable.
+    // The arm64 slice of macOS's ONE fat library: the target embeds only its arch. The Intel
+    // slice is gone: every blob is a redistribution obligation and audit surface for EVERY
+    // consumer. An Intel Mac still loads a driver from disk; only `bundled` is out.
     Vendored {
         file: "vendor/driver-aarch64-macos.bin",
         source: "the arm64 slice of the universal library in the release below",
@@ -146,12 +110,8 @@ mod embed {
     const DRIVER_FILE: &str = "vendor/driver-aarch64-macos.bin";
 
     // A target with no vendored driver fails HERE, at build time, naming what is missing — rather
-    // than building something that quietly behaves like a non-bundled build on that platform only.
-    //
-    // Vendoring another platform's library is: extract it from the release named in `VENDORED`,
-    // drop it in `vendor/` under the same naming scheme, and add its `cfg` arm above plus its row
-    // in `VENDORED`. Nothing else — `staged_path`'s unix hardening is written against every unix,
-    // not against a target list.
+    // than quietly behaving like a non-bundled build on that platform only. To vendor another:
+    // extract it from the release in `VENDORED`, add the file, a `cfg` arm above and a row.
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "x86_64"),
@@ -174,28 +134,9 @@ mod embed {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     const STAGED_NAME: &str = "libkdi_driver.so";
 
-    /// Write `DRIVER` to a private directory under the system temp dir if it is not already there,
-    /// and hand back the path to load.
-    ///
-    /// The directory name is the first 16 hex chars of the driver's recorded SHA-256, which is
-    /// what makes a STALE COPY impossible to load: a build with a different driver stages a
-    /// different directory, so an older version's file is never picked up, and nothing has to be
-    /// cleaned up on upgrade. The file itself is written to a per-process, per-call temporary name
-    /// and renamed into place, so two processes — or two threads in one process — racing their
-    /// first use cannot see a half-written library. The loser of the race finds the winner's file
-    /// already correct and uses it.
-    ///
-    /// Errors are ordinary [`io::Error`]s with the directory in the message: a read-only temp dir,
-    /// or one the process may not write, is a real deployment condition and the caller has a way
-    /// out (`$KDI_DRIVER_DIR`). A temp dir mounted `noexec` fails later, at `dlopen`, and `usb3.rs`
-    /// reports it there.
-    ///
-    /// UNIX: the directory is created 0700 and then CHECKED, because on unix the temp dir is
-    /// shared between users and this directory's name is a hash of public bytes — so another local
-    /// user can compute it and pre-create it, and whatever library they leave inside is what this
-    /// process would `dlopen`. [`trusted_dir`] is what closes that, and it runs BEFORE the
-    /// already-staged shortcut below, which would otherwise hand back an attacker's file. Windows'
-    /// temp dir is per-user, so the check is a no-op there.
+    /// Write `DRIVER` under the system temp dir if it is not already there, and hand back the path.
+    /// The directory is named for the driver's SHA-256, so a STALE COPY cannot be loaded, and the
+    /// file is renamed into place; [`trusted_dir`] runs BEFORE the already-staged shortcut.
     pub(crate) fn staged_path() -> io::Result<PathBuf> {
         let sha16 = &super::VENDORED
             .iter()
@@ -238,9 +179,8 @@ mod embed {
     }
 
     /// Create the staging directory, 0700 on unix so that nobody else can put a file in it.
-    ///
-    /// Already-exists is success — the reuse across processes is the whole point of the hashed
-    /// name — and [`trusted_dir`] is what decides whether an existing one may be used.
+    /// Already-exists is success — reuse across processes is the point of the hashed name — and
+    /// [`trusted_dir`] is what decides whether an existing one may be used.
     fn create_dir_private(dir: &std::path::Path) -> io::Result<()> {
         let mut b = fs::DirBuilder::new();
         b.recursive(true);
@@ -265,14 +205,9 @@ mod embed {
         None
     }
 
-    /// Refuse a staging directory another local user could have put a file into.
-    ///
-    /// Group/other-writable is one hole: we could write, they could write. A 0755 directory they
-    /// own is the other: we can traverse and `dlopen`, they planted the file. Permissions alone
-    /// are not decisive — the owner must be us too.
-    ///
-    /// `symlink_metadata`, not `metadata`: a symlink planted at this path would otherwise be
-    /// followed and the real directory's permissions checked instead of the attacker's.
+    /// Refuse a staging directory another local user could have put a file into: group/other-
+    /// writable, or a 0755 one THEY own — permissions alone are not decisive, the owner must be us.
+    /// `symlink_metadata`, not `metadata`: a planted symlink would have the real dir checked.
     #[cfg(unix)]
     fn trusted_dir(dir: &std::path::Path) -> io::Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -313,17 +248,15 @@ mod embed {
     }
 
     /// Length, not contents: the file is 2 MB and this runs on the way to every device open. The
-    /// name it sits under is already a hash of the bytes, and [`trusted_dir`] has already required
-    /// that we own a 0700 directory, so length is the second half of a check whose first half is
-    /// the directory.
+    /// name is already a hash of the bytes and [`trusted_dir`] has required a 0700 directory we
+    /// own, so length is the second half of a check whose first half is the directory.
     fn is_staged(path: &std::path::Path) -> bool {
         fs::metadata(path).is_ok_and(|m| m.len() == DRIVER.len() as u64)
     }
 
     /// The staging is a file-system dance with a race in it, and this is the check that it works:
-    /// stage twice, get the same path, and find the whole library there both times. The second call
-    /// is the one that exercises "already staged" — the branch that would otherwise only be hit in
-    /// production.
+    /// stage twice, get the same path, find the whole library both times. The second call is what
+    /// exercises "already staged" — the branch that would otherwise only be hit in production.
     #[cfg(test)]
     mod tests {
         #[test]
@@ -364,10 +297,8 @@ mod embed {
         }
 
         /// The attack the unix hardening exists for: another local user gets there first and leaves
-        /// a directory anyone can write to. Loading out of it would mean loading their library.
-        ///
-        /// Asserted on a directory built here rather than by racing the real one, because the real
-        /// path is a fixed hash and a test must not depend on winning a race against itself.
+        /// a directory anyone can write to, so loading out of it loads their library. Asserted on a
+        /// directory built here — the real path is a fixed hash and must not race itself.
         #[cfg(unix)]
         #[test]
         fn a_world_writable_staging_directory_is_refused() {

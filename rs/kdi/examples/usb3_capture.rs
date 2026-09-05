@@ -1,24 +1,6 @@
-//! Sparse-lane / burst-alignment capture over USB3. Fixed stdout, one line per fact.
-//!
-//! ```text
-//! cargo run --features usb3 --example usb3_capture -- samples [serial]
-//! cargo run --features usb3 --example usb3_capture -- digital [serial]
-//! ```
-//!
-//! Does **not** flash. `samples` defaults to `lanes = 1 << 2` and `burst = 6`; `digital` starts
-//! with `burst = 1`, which [`kdi::Device::start`] must raise to 2 (88 B × 1 is not 16-byte
-//! aligned). These logs are diffed between runs; do not print timestamps.
-//!
-//! THE LANE MASK IS AN ARGUMENT, because the default is not universal and a wrong one is silent.
-//! Which KDI lane carries a headstage depends on the board and on which RHX streams the engine is
-//! capturing (`WI_STREAM_EN`). Ask for a lane nothing feeds and every amplifier reads `0xFFFF` —
-//! well-formed frames, correct cadence, zero loss, and no error anywhere. On the reference board the
-//! chip is on lane 0 with RHX stream 0 enabled (`tools/kdi_rhd_content.py:24-27`), and the `1 << 2`
-//! default here read idle for exactly that reason.
-//!
-//! ```text
-//! cargo run --features usb3 --example usb3_capture -- samples [serial] [lane-mask-hex] [free]
-//! ```
+//! Sparse-lane capture over USB3; no flash. `usb3_capture [samples|digital] [serial]
+//! [lane-mask-hex] [free]`; `digital`'s burst 1 raises to 2 (88 B is not 16-B aligned). LANE
+//! MASK: the chip is on lane 0, so `1 << 2` idles (`tools/kdi_rhd_content.py:4-4`).
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -43,14 +25,8 @@ fn main() -> ExitCode {
         .and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok())
         .unwrap_or(default_lanes);
     // A fourth argument `free` drops the burst bound and nothing else, so the lane mask stays an
-    // independent axis. That matters: `Acquisition::default()` changes BOTH at once (`lanes: !0,
-    // burst: None`), and the first version of this arm used `default()` verbatim, which reported
-    // SUSPECT without saying whether the free run or the 32-lane mask caused it. Pass
-    // `ffffffff free` to reproduce `default()` exactly; vary one at a time to attribute a result.
-    //
-    // Free-running exercises two things a bounded burst cannot: the free-running gateware path,
-    // and `stop()` on a stream that is still producing -- bounded, the stream has already stopped
-    // itself by the time we ask, so that falling-edge flush is never tested.
+    // independent axis (`Acquisition::default()` changes BOTH: `lanes: !0, burst: None`; pass
+    // `ffffffff free` for it). Only free-running tests `stop()` on a stream still producing.
     let free = args.next().as_deref() == Some("free");
 
     let mut dev = match kdi::Device::open_usb3(&serial, None) {
@@ -61,9 +37,8 @@ fn main() -> ExitCode {
         }
     };
     // EVERY HOST OWES THIS WRITE (#131, contract 0.5). An unconfigured device emits nothing on
-    // `rhd_matrix`, and before the capability existed it emitted one frame per twenty sample
-    // periods while declaring the full cadence. Non-fatal, so this still runs against pre-0.5
-    // gateware, where the rate is whatever the last host left.
+    // `rhd_matrix`; before the capability existed it emitted one frame per twenty sample periods
+    // while declaring the full cadence. Non-fatal: pre-0.5 gateware keeps whatever rate was left.
     if let Err(e) = dev.set_rate(42, 25) {
         eprintln!("note: rate not configured ({e}) - pre-0.5 gateware");
     }
@@ -88,18 +63,9 @@ fn main() -> ExitCode {
     let mut lane_ids = String::from("-");
     let mut amp0_lane2 = String::from("-");
     let mut amp0_lane0 = String::from("-");
-    // ONE SAMPLE PROVES NOTHING ABOUT THE ANALOGUE PATH. A lane nothing feeds returns 0xFFFF on
-    // every row -- well-formed frames, right cadence, zero loss -- and a single reading cannot tell
-    // that from a quiet channel. What separates them needs no known value: a lane nothing feeds is
-    // CONSTANT, so its per-row variability is zero, while a lane carrying a headstage moves. That
-    // is the claim this makes, and the verdict below states its limits.
-    //
-    // The statistic is a PER-ROW STANDARD DEVIATION, and the row it is taken over is why. A min-max
-    // spread pooled over all 32 amplifier channels and compared against a single aux row is biased
-    // by construction -- a range grows with the size of the pool -- so it reported a healthy
-    // ordering on data that does not have one. Per-row stddev compares like with like.
-    //
-    // Rows 0..31 are the amplifier channels, 32 and 33 the two aux rows.
+    // ONE SAMPLE PROVES NOTHING: a lane nothing feeds returns 0xFFFF on every row -- well-formed,
+    // right cadence, zero loss -- so the test is variability, not value. PER-ROW stddev, because a
+    // min-max pooled over 32 channels is biased by pool size. Rows 0..31 amplifier, 32/33 aux.
     let (mut sum, mut sumsq) = ([0f64; 34], [0f64; 34]);
     let mut sampled = 0u32;
     // A free-running stream never returns `Ok(None)`, so the wall clock is the only bound. No
@@ -164,23 +130,9 @@ fn main() -> ExitCode {
         let (temp_sd, supply_sd) = (sd(32), sd(33));
         println!("amp_sd          {amp_sd:.1}   ({sampled} readings)");
         println!("aux_sd          {temp_sd:.1} temp, {supply_sd:.1} supply");
-        // WHAT THIS DOES AND DOES NOT ESTABLISH. A lane nothing feeds reads a constant 0xffff, so
-        // its stddev is 0 -- that separation is sound whatever the input is doing, and it is the
-        // bug that actually shipped: a capture of a dead lane, well-formed and zero-loss.
-        //
-        // ROW ALIGNMENT IS NOT DECIDED HERE, and an earlier version of this example claimed it was.
-        // The premise is that amplifier rows move more than the two slow aux rows, which holds only
-        // for a DRIVEN input; on a bench with floating inputs both are noise and the comparison
-        // decides nothing. It read LIVE anyway because it compared min-max spread pooled over 32
-        // amplifier channels against 1 aux row, and a min-max range grows with the size of the pool
-        // -- so it passed for a structural reason, not a measurement. Per-row stddev removes that
-        // bias, and with it removed this bench's temp row is NOISIER than the mean amplifier row
-        // (measured 5062 vs 4266 free-running, 4022 vs 1897 bounded; `tools/kdi_rhd_content.py`
-        // independently reads the same shape, which is also what rules out a decoder fault).
-        //
-        // The authority on row order is the golden chip-model sim, which drives known values
-        // through a modelled headstage (docs/rhd_chip_model.md, rhd/RhdCore.scala:236-247). The
-        // numbers above are reported so a user with a driven input can apply the test themselves.
+        // ROW ALIGNMENT IS NOT DECIDED HERE: the premise needs a DRIVEN input; here the temp
+        // row is NOISIER than the mean amplifier row (5062 vs 4266 free, 4022 vs 1897 bounded).
+        // Row order's authority is the chip-model sim (rhd/RhdCore.scala:146-153).
         println!(
             "verdict         {}",
             if amp_sd <= 5.0 {

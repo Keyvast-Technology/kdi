@@ -1,21 +1,6 @@
-//! Load a caller-supplied bitstream onto a board, bind it, and print what came back.
-//!
-//! ```text
-//! cargo run --features usb3 --example usb3_configure -- <bit> [serial]
-//! ```
-//!
-//! `image` is **the** release bitstream — `make all` / the GitHub release asset — not a second
-//! copy this crate vendors. Configuration is **volatile**: it does not touch flash and a power
-//! cycle undoes it. It is still state-changing on a shared instrument — whatever was running is
-//! gone until someone loads it again — so unlike `usb3_handshake`, this is not safe to run against
-//! a board someone else is using.
-//!
-//! The path is required and the example fails closed if it is missing. The configure's status is
-//! checked inside `open_usb3_configured`; a failure names the driver status and leaves the board
-//! on whatever was resident. This program does not compare the identity against a compiled-in
-//! constant — without a known image the library cannot know the WireOut sha. It prints
-//! `gateware_sha` / `contract` / `fw_sha` so a caller (or `make kdi-rs-bench`) can compare them
-//! to the artifact that was just sent.
+//! Load a caller-supplied bitstream onto a board, bind it, print its identity: `usb3_configure
+//! <bit> [serial]`, `<bit>` being **the** release bitstream (`make all`). Volatile — no flash — but
+//! it evicts whatever was running: NOT safe on a shared board. Compare the printed sha yourself.
 
 use std::fs;
 use std::process::ExitCode;

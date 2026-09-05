@@ -92,7 +92,7 @@ pub enum Kind {
     ///
     /// One RHD acquisition lane per lane id. ROW ORDER IS ROTATED BY ONE and this is a property of
     /// the hardware, not a choice: the RHD SPI returns a command's result during the NEXT command,
-    /// so row k carries the capture from command k-1 (RhdCore.scala:218-225, hardware-caught in PR
+    /// so row k carries the capture from command k-1 (RhdCore.scala:216-218, hardware-caught in PR
     /// #15). Concretely:
     ///
     /// ```text

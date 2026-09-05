@@ -4,7 +4,9 @@
     "vendor": "keyvast",
     "type": "a75",
     "impl_version": 1,
-    "compatible": "keyvast-a75"
+    "compatible": "keyvast-a75",
+    "board_id": 2677,
+    "proto": 1
   },
   "caps": {
     "0": "clean_frame",
@@ -219,7 +221,7 @@
     {
       "name": "lanes_samples",
       "access": "rw",
-      "doc": "bit i = include acquisition lane i in rhd_matrix"
+      "doc": "bit i = include acquisition lane i in rhd_matrix. RESETS TO 0 and a mask of 0 emits nothing, so write it before run_samples or the stream never produces a frame"
     },
     {
       "name": "burst_samples",
@@ -460,7 +462,7 @@
               "midpoint": 32768
             }
           ],
-          "doc": "One RHD acquisition lane per lane id. ROW ORDER IS ROTATED BY ONE and this is a property of the hardware, not a choice: the RHD SPI returns a command's result during the NEXT command, so row k carries the capture from command k-1 (RhdCore.scala:218-225, hardware-caught in PR #15). Concretely:\n  row 0        the PREVIOUS timestep's aux2 (aux_adc) \u2014 note the lag\n  rows 1..32   amplifier channels 0..31, ascending\n  rows 33,34   this timestep's aux0 (temp) and aux1 (supply)\nA host that assumes rows 0..31 are the amplifier reads channel n at row n and gets channel n-1, with row 0 pure garbage \u2014 plausible-looking neural data at the wrong index, which is exactly the failure PR #15 shipped once already. Amplifier codes are offset binary around 0x8000, NOT two's complement. The volts-per-code scale is a property of the chip profile and is deliberately NOT published here: a profile swap is a MAJOR bump a host must refuse to bind, never silently rescale.\n"
+          "doc": "One RHD acquisition lane per lane id. ROW ORDER IS ROTATED BY ONE and this is a property of the hardware, not a choice: the RHD SPI returns a command's result during the NEXT command, so row k carries the capture from command k-1 (RhdCore.scala:216-218, hardware-caught in PR #15). Concretely:\n  row 0        the PREVIOUS timestep's aux2 (aux_adc) \u2014 note the lag\n  rows 1..32   amplifier channels 0..31, ascending\n  rows 33,34   this timestep's aux0 (temp) and aux1 (supply)\nA host that assumes rows 0..31 are the amplifier reads channel n at row n and gets channel n-1, with row 0 pure garbage \u2014 plausible-looking neural data at the wrong index, which is exactly the failure PR #15 shipped once already. Amplifier codes are offset binary around 0x8000, NOT two's complement. The volts-per-code scale is a property of the chip profile and is deliberately NOT published here: a profile swap is a MAJOR bump a host must refuse to bind, never silently rescale.\n"
         }
       ],
       "stream_id_blocks": [

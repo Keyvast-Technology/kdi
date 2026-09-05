@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 # Fetch the USB3 drivers `--features bundled` compiles in, and verify them against the provenance
-# table that lives in the source.
-#
-# WHY THIS EXISTS RATHER THAN FIVE TRACKED BINARIES. The bytes must be in the PUBLISHED crate — a
-# crates.io consumer has no pipeline and no credential for a private release — but they need not be
-# in git, and five opaque blobs in a source tree cost more in comprehension than they save. So the
-# repository keeps the part that is reviewable (file, source, sha256, length in `src/bundled.rs`)
-# and this script reconstitutes the part that is not.
-#
-# The table is the anchor, not this script: every fetched file is hashed against it and a mismatch
-# is fatal. That is a STRONGER guarantee than tracking the blobs gave, because it is checked on
-# every fetch rather than only when someone happens to run the test.
+# table in `src/bundled.rs` (file, source, sha256, length), which is the anchor rather than this
+# script. The bytes must be in the PUBLISHED crate -- a consumer has no credential -- not in git.
 set -euo pipefail
 
-REPO=Keyvast-Technology/hdl-opalkelly-xem7310
+# CONFIGURED, NOT HARDCODED: this script is mirrored into the public repo, where naming the
+# private sibling that holds the drivers tells a customer where private code lives.
+REPO="${VENDOR_DRIVER_REPO:-${KV_DRIVER_REPO:-}}"
+[ -n "$REPO" ] || { echo "set VENDOR_DRIVER_REPO to the owner/name holding the driver release" >&2; exit 2; }
 TAG=frontpanel-6.0.0
 # Destination is an ARGUMENT with the in-repo default, because this script is mirrored into the
 # public repo where the layout differs -- a path computed from $0 is right in exactly one of
@@ -42,7 +36,7 @@ for spec in "${SPECS[@]}"; do
 import struct, sys, pathlib
 fat = pathlib.Path(sys.argv[1]).read_bytes()
 want = {"x86_64": 0x1000007, "arm64": 0x100000C}[sys.argv[2]]
-assert struct.unpack(">I", fat[:4])[0] in (0xCAFEBABE, 0xCAFEBABF), "not a universal binary"
+assert struct.unpack(">I", fat[:4])[0] == 0xCAFEBABE, "not a 32-bit fat mach-o (FAT64 unsupported here)"
 n = struct.unpack(">I", fat[4:8])[0]
 for i in range(n):
     cpu, _sub, off, size, _al = struct.unpack(">iiIII", fat[8 + i * 20 : 28 + i * 20])

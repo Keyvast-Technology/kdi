@@ -1,18 +1,6 @@
-//! Bind a device, read what it can do, and drive the typed command channel. NO HARDWARE NEEDED.
-//!
-//! Same setup as `stream.rs`. From the repo root, in one terminal:
-//!
-//! ```text
-//! ```
-//!
-//! and in another:
-//!
-//! ```text
-//! cargo run --example control                # first device found
-//! cargo run --example control -- KVDEMO      # that serial specifically
-//! ```
-//!
-//! Every command here is read-only or refused. It never powers a rail up and never drives a pin.
+//! Bind a device, read its capabilities, drive the typed command channel. NO HARDWARE NEEDED:
+//! same setup as `stream.rs`, then `cargo run --example control [SERIAL]` (no serial = first
+//! device). Every command here is read-only or refused; never powers a rail or drives a pin.
 
 use kdi::{Cap, ChMode, Commands, ConnectOpts, Device, DeviceErr, Error, Filter};
 
@@ -64,12 +52,9 @@ fn main() -> Result<(), Error> {
         power.present, power.reverify,
     );
 
-    // `valid` is a HARDWARE flag (bit 16 of the sample register), not a transport check, and
-    // `false` here is the expected reading rather than a fault: a conversion only completes on a
-    // channel that is in `adc` mode, and this program deliberately does not set a mode on a
-    // populated slot -- that would reconfigure someone else's instrument. Measured on silicon with
-    // slot 0 seated: `codes [0, 0] valid [false, false]`. Read a code as data only when its
-    // `valid` is true; the pair is reported together for exactly that reason.
+    // `valid` is a HARDWARE flag (bit 16 of the sample register), and `false` here is expected: a
+    // conversion only completes in `adc` mode, and this program will not set a mode on a populated
+    // slot. Measured on silicon, slot 0 seated: `codes [0, 0] valid [false, false]`.
     if let Some(slot) = (0..8).find(|s| power.present >> s & 1 != 0) {
         let adc = dev.adio_adc(slot, 0, Some(2))?;
         println!(
@@ -78,22 +63,9 @@ fn main() -> Result<(), Error> {
         );
     }
 
-    // ── what a refusal looks like ────────────────────────────────────────────────────────────
-    // `Device::raw_cmd` would hand a device error back as `Ok(Reply)` — a device error is data —
-    // but a TYPED method was asked for an `AdioMode`, and a refusal contains none, so it arrives
-    // as `Err(Error::Device)`.
-    //
-    // THE MODE MATTERS. The firmware gates on DRIVING modes only: `out`/`dac` against a slot the
-    // power tree says is empty is refused `not_present`, while a non-driving mode is allowed
-    // because it drives nothing (sw/zephyr/app/console/src/kdi_ctl.c:269-277). An earlier version
-    // of this example asked for `Off, Off` here and called it a refusal, so on real hardware it
-    // silently took the Ok branch and demonstrated nothing — measured on silicon as
-    // `adio.mode slot 1: ch_mode 0x0000`, printed by the success arm of a block titled "what a
-    // refusal looks like".
-    //
-    // Asking for a DRIVE on that same empty slot is the refusal, and it is safe by construction:
-    // the firmware decides with the SAME present-mask this program just read, so a slot that reads
-    // empty here is refused there before any pin is driven.
+    // THE MODE MATTERS: the firmware gates on DRIVING modes, so `out`/`dac` on an empty slot is
+    // refused `not_present` while `Off` is allowed and proves nothing
+    // (sw/zephyr/app/console/src/kdi_ctl.c:264-264). Safe: gated on the present-mask above.
     if let Some(empty) = (0..8).find(|s| power.present >> s & 1 == 0) {
         match dev.adio_mode(empty, ChMode::Out, ChMode::Off) {
             // Reaching here means the safety gate did NOT fire and a drive was configured on a

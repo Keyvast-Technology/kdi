@@ -14,12 +14,12 @@
 // lib.rs opens with. A generated method knows a command NAME and an argument ORDER, nothing else.
 //
 // Why type them at all: `Device::raw_cmd` is stringly-typed, so `raw_cmd("adio.adc", &["1", "0"])`
-// transposes slot and channel with no complaint (the failure kdi/frontpanel.py:80-85 documents),
+// transposes slot and channel with no complaint (the failure kdi/frontpanel.py:61 documents),
 // an out-of-range slot is learned a round trip later, and a misspelled name is learned on the
 // wire. Every range below comes from contract.yaml and is checked BEFORE a byte is sent; the
 // refusal is `HostErr::HostUnsafeArg`, which is the contract's own token for "refused by the host
 // before it reached the wire" — `host_errors` is a CLOSED set and a conforming library mints none
-// of its own (kdi/contract.yaml:90-94).
+// of its own (kdi/contract.yaml:88).
 
 #![allow(dead_code)]
 
@@ -30,7 +30,7 @@ use serde_json::Value;
 use crate::{io_err, Device, Error, HostErr, Reply};
 
 /// Every published command with its declared argument order. THE ORDER IS THE WIRE
-/// (`request.arg_order: declared`, kdi/contract.yaml:770), so a host serialising a
+/// (`request.arg_order: declared`, kdi/contract.yaml:413), so a host serialising a
 /// positional `Device::raw_cmd` call reads it from here instead of keeping a second copy of
 /// the registry — the copy that goes stale is the one that transposes two arguments.
 /// The RESERVED session commands are listed too: they have no typed method, but they are
@@ -401,7 +401,7 @@ impl Commands for Device {
 // RESERVED, and deliberately without typed methods: `sys.claim`, `sys.release`, `sys.challenge`,
 // `sys.unlock`. Every one is `scope: session`, pending P3b — the grant canonicalisation and the
 // signature scheme are NOT published, so a host must not depend on the shape of what it signs, and
-// a build may legally answer `unknown_cmd` to any of them (kdi/contract.yaml:551-569). A typed
+// a build may legally answer `unknown_cmd` to any of them (kdi/contract.yaml:261-274). A typed
 // method here would claim a settled shape. They stay in `COMMANDS` above, so `Device::raw_cmd` can
 // still drive one positionally.
 

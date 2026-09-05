@@ -1,24 +1,6 @@
-//! Acquisition: a stream as a sequence of RECORDS, not a sequence of bytes.
-//!
-//! This module is the reason the decoder is a hidden module rather than part of the API. Frames, CRCs,
-//! magic-word resync, reject tokens, descriptor strides and partial-frame carry are all real and
-//! all necessary — and every one of them is plumbing a consumer of an instrument library should
-//! never have had to hold. `kdi` holds them here, once.
-//!
-//! Three defects paid for the shape of this file:
-//!
-//! * **The carry lives with the stream that owns it.** The Python reference kept both residue
-//!   buffers on the CLIENT keyed by stream name, and both leaked across streams on real hardware
-//!   (the Python reference host): one loudly (`crc_err` at byte 0), one silently (a `digital` read
-//!   that returned rhd_matrix frames with valid CRCs and monotonic timestamps). One
-//!   [`StreamReader`] owns one stream's buffer, so neither is representable.
-//! * **A bad frame is COUNTED, not raised.** A recording must not die on one flipped bit. Rejected
-//!   frames are resynced past and land in [`Stats::bad_frames`]; their absence still shows up in
-//!   the next record's [`Record::lost_before`], from the timestamp gap. An `Err` out of
-//!   [`StreamReader::next`] means the TRANSPORT failed, which is a different thing entirely.
-//! * **The loss oracle is applied, not exported.** The Python reference published `lost_frames()`
-//!   and a bench tool then fed it frames the HOST had already thrown away, so device loss and host
-//!   loss added together. Here only the reader — which knows which frames it dropped — may ask.
+//! Acquisition: a stream as a sequence of RECORDS, not of bytes. Frames, CRCs, magic resync,
+//! reject tokens, descriptor strides and partial-frame carry are plumbing a consumer of an
+//! instrument library should never hold, so `kdi` holds them here — one buffer per stream, once.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -40,37 +22,29 @@ const MAX_CARRY: usize = READ_BYTES;
 /// bounded capture is not paced by it, long enough that an idle stream does not spin a core.
 const POLL: Duration = Duration::from_millis(2);
 
-/// How to acquire. `lanes` is the rhd_matrix acquisition-lane mask (ignored by streams that have no
-/// lane register). `burst` requests a bounded capture; [`Device::start`] may raise it for transport
-/// alignment. This is the only mode where loss cannot happen INSIDE the data — free-running, a host
-/// that cannot drain continuously gets frames that straddle a hole and cannot tell where the hole
-/// is (kdi/contract.yaml:152-157).
+/// Per-read budget inside [`Device::live_lanes`]. Long enough that a configured device answers,
+/// short enough that an empty one ends the probe rather than stalling a caller's bring-up.
+const PROBE_WAIT: Duration = Duration::from_millis(100);
+
+/// How to acquire. `lanes` is the rhd_matrix acquisition-lane mask (ignored where there is no lane
+/// register). `burst` bounds the capture — the only mode where loss cannot happen INSIDE the data:
+/// free-running, a host that cannot drain gets an unlocatable hole (contract.yaml:152-157).
 #[derive(Clone, Debug)]
 pub struct Acquisition {
     /// Bit i selects acquisition lane i. IGNORED by a stream that declares no lane register
     /// (`digital` is one), because the contract has no register there to write it to.
     pub lanes: u32,
     /// `Some(n)` is the requested bound; [`Device::start`] raises it to the smallest USB3-aligned
-    /// burst that still covers `n`. `None` free-runs. [`StreamReader::aligned_burst`] remains the
-    /// tight calculator once a frame has been seen — an unaligned bound leaves a partial group
-    /// behind that nothing can retrieve, because a bounded capture has no next read to carry it
-    /// into.
+    /// burst covering `n`, and `None` free-runs. An unaligned bound strands a partial group nothing
+    /// can retrieve: a bounded capture has no next read to carry it into ([`StreamReader`]).
     pub burst: Option<u16>,
 }
 
 impl Default for Acquisition {
     fn default() -> Self {
-        // Every lane, free-running. A mask of 0 emits nothing — a stream with no lanes is not a
-        // stream (kdi/contract.yaml:148-151) — so the safe default is all of them, not none.
-        //
-        // KNOW WHAT THIS COSTS: it is also the highest-bandwidth configuration the device can be
-        // put in, and on `rhd_matrix` at a high rate the link cannot carry it. Measured on silicon
-        // at 30 kS/s with all 32 lanes (35 rows × 32 lanes × 16 bits ≈ 2.3 kB per frame, ≈ 68 MB/s):
-        // 22 768 records delivered and 125 364 reported lost over five seconds. Nothing is hidden —
-        // `Record::lost_before` accounts for every one, which is the contract working — but a
-        // caller who wants no loss narrows `lanes` to the lanes actually populated, or bounds the
-        // capture with `burst`. One lane at the same rate is ≈ 4 MB/s of frame payload; free-running
-        // loss at that width has been measured only at 1 kS/s, where it is zero.
+        // Every lane, free-running: a mask of 0 emits nothing (contract.yaml:148-151), so all is
+        // the safe default — and also the most bandwidth. Measured, 32 lanes at 30 kS/s (≈68 MB/s):
+        // 22 768 delivered, 125 364 lost in 5 s. Narrow `lanes`, or bound the capture with `burst`.
         Self {
             lanes: !0,
             burst: None,
@@ -79,28 +53,13 @@ impl Default for Acquisition {
 }
 
 impl Device {
-    /// Start a stream and return its reader.
-    ///
-    /// Performs the contract's `run_restart` sequence internally (kdi/contract.yaml:399-404): stop,
-    /// arm the burst WHILE STOPPED, then start. The FALLING edge is what flushes the device's pipe
-    /// buffers in every clock domain, resets the packer phase and clears the sticky overrun;
-    /// re-asserting an already-set bit starts nothing and inherits the previous run's state —
-    /// measured on hardware as an immediate rc=-75 from a flag belonging to the earlier run
-    /// (the Python reference host). The bound is latched at frame admission, so it must be in place
-    /// before the rising edge.
-    ///
-    /// The host half of that rule (`run_restart_host`) is discharged by construction: the new
-    /// reader starts with an empty buffer, so no partial frame from the previous run can head the
-    /// new one's bytes.
-    ///
-    /// When `Acquisition.burst` is `Some(want)`, the bound is the smallest aligned value that
-    /// still covers `want`, not the raw request — a USB3 pipe read is a multiple of 16 bytes and a
-    /// KDI frame usually is not.
+    /// Start a stream and return its reader. The contract's `run_restart` (yaml:399-404): stop, arm
+    /// the burst WHILE STOPPED, then start. The FALLING edge flushes the pipes, resets the packer
+    /// phase and clears the sticky overrun; re-asserting inherits the previous run (rc=-75).
     pub fn start(&mut self, s: Stream, a: &Acquisition) -> Result<StreamReader<'_>, Error> {
-        // #131: an unconfigured device emits NOTHING on rhd_matrix, by design -- before this
-        // contract it emitted one frame per twenty sample periods while declaring the full cadence,
-        // which no host could detect. Without this check a host that forgot `set_rate` gets a
-        // silent stream and no reason, so name the missing call instead.
+        // #131: an unconfigured device emits NOTHING on rhd_matrix, by design — before this
+        // contract it emitted one frame per twenty periods declaring full cadence, undetectably.
+        // Without this check a host that forgot `set_rate` gets silence and no reason.
         if s == Stream::Samples && self.caps().has(crate::Cap::RateControl) && !self.rate_ready()? {
             return Err(io_err(
                 io::ErrorKind::InvalidInput,
@@ -128,7 +87,7 @@ impl Device {
         if let Some(lanes_reg) = lanes {
             self.write_field(lanes_reg, a.lanes)?;
         }
-        // The reference host waits here (`kdi/client.py:237`) and it costs nothing: two WireIn
+        // The reference host waits here (`kdi/client.py:170`) and it costs nothing: two WireIn
         // updates are microseconds apart on USB3, and the gateware's flush crosses clock domains.
         std::thread::sleep(Duration::from_millis(10));
         self.write_field(run, 1)?;
@@ -139,6 +98,206 @@ impl Device {
             pos: 0,
             dec: Decoder::default(),
         })
+    }
+
+    /// Which lanes carry a chip: nothing published says, so one bounded burst measures it. **A lane
+    /// with no chip reads a constant** — `0xffff` idle, `0` unfitted, 100% over 1.47M samples.
+    /// Narrowing took a host from 86.5% loss to zero. Quiet ≠ absent, so it returns the mask only.
+    pub fn live_lanes(&mut self, s: Stream, records: u16) -> Result<u32, Error> {
+        let mut live = 0u32;
+        let mut rd = self.start(
+            s,
+            &Acquisition {
+                lanes: !0,
+                burst: Some(records.max(1)),
+            },
+        )?;
+        // Bounded above by `records` reads that yield nothing, so a silent device ends the probe
+        // instead of hanging it.
+        let mut idle = 0;
+        while idle < i32::from(records.max(1)) {
+            match rd.next(PROBE_WAIT)? {
+                None => idle += 1,
+                Some(rec) => {
+                    for b in rec.blocks() {
+                        if b.kind() != Kind::RhdMatrix {
+                            continue;
+                        }
+                        let rows = b.rows();
+                        let nlanes = b.lanes().len().min(32) as u16;
+                        for l in 0..nlanes {
+                            for r in 0..rows {
+                                match b.value(r, l) {
+                                    Some(v) if v != 0xffff && v != 0 => {
+                                        live |= 1u32 << l;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rd.stop()?;
+        Ok(live)
+    }
+
+    /// Start several streams at once and read them through ONE borrow. They are **not co-sampled**:
+    /// each record is tagged with its stream and carries that stream's own timestamp, so join them
+    /// by timestamp (one timebase, exact integer arithmetic), never by arrival order.
+    pub fn start_multi(
+        &mut self,
+        want: &[(Stream, Acquisition)],
+    ) -> Result<MultiReader<'_>, Error> {
+        if want.is_empty() {
+            return Err(io_err(
+                io::ErrorKind::InvalidInput,
+                "start_multi needs at least one stream",
+            ));
+        }
+        // A stream named twice would give two decoders the same bytes, and each would report the
+        // other's frames as loss.
+        for (i, (s, _)) in want.iter().enumerate() {
+            if want[..i].iter().any(|(o, _)| o == s) {
+                return Err(io_err(
+                    io::ErrorKind::InvalidInput,
+                    format!("stream {s:?} requested twice"),
+                ));
+            }
+        }
+
+        for (s, a) in want {
+            let (run, burst, _, lanes) = stream_regs(*s);
+            let bound = match a.burst {
+                Some(w) => codec::aligned_burst_at_least(
+                    s.max_frame_bytes() as u32,
+                    u32::from(w),
+                    USB3_READ_ALIGNMENT as u32,
+                )
+                .and_then(|n| u16::try_from(n).ok())
+                .ok_or_else(|| {
+                    io_err(
+                        io::ErrorKind::InvalidInput,
+                        format!("burst {w} cannot be represented after alignment"),
+                    )
+                })?,
+                None => 0,
+            };
+            self.write_field(run, 0)?;
+            self.write_field(burst, u32::from(bound))?;
+            if let Some(lanes_reg) = lanes {
+                self.write_field(lanes_reg, a.lanes)?;
+            }
+        }
+        // One wait for all of them, after every falling edge and before any rising one: the flush
+        // crosses clock domains, and per-stream waits would only stagger the starts further.
+        std::thread::sleep(Duration::from_millis(10));
+        for (s, _) in want {
+            self.write_field(stream_regs(*s).0, 1)?;
+        }
+
+        Ok(MultiReader {
+            dev: self,
+            lanes: want
+                .iter()
+                .map(|(s, _)| Lane {
+                    stream: *s,
+                    buf: Vec::new(),
+                    pos: 0,
+                    dec: Decoder::default(),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// The `run` register of a stream, so `Device::quiesce` can clear it without duplicating the
+/// register table. Crate-private: which register carries a run bit is not a host's business.
+pub(crate) fn run_reg(s: Stream) -> &'static str {
+    stream_regs(s).0
+}
+
+/// One stream's decode state inside a [`MultiReader`]: the same buffer, carry and decoder a
+/// [`StreamReader`] owns, minus the device borrow that made holding two impossible.
+struct Lane {
+    stream: Stream,
+    buf: Vec<u8>,
+    pos: usize,
+    dec: Decoder,
+}
+
+/// Several live streams sharing one device borrow, from [`Device::start_multi`]. Reading is
+/// round-robin and fair: each call advances every stream's decoder before refilling any, so a fast
+/// stream cannot starve a slow one of attention.
+pub struct MultiReader<'d> {
+    dev: &'d mut Device,
+    lanes: Vec<Lane>,
+}
+
+impl MultiReader<'_> {
+    /// The next record from any stream, tagged with which, or `None` if none arrived within
+    /// `timeout`. As with [`StreamReader::next`] the record borrows the reader: consume it before
+    /// the next call — including the OTHER stream's, since one buffer's refill invalidates it.
+    pub fn next(&mut self, timeout: Duration) -> Result<Option<(Stream, Record<'_>)>, Error> {
+        let deadline = Instant::now() + timeout;
+        // Indices, not borrows: the loop both refills buffers and must end holding a borrow of one,
+        // which does not typecheck any other way. Same trade StreamReader::next makes.
+        let dev = &mut *self.dev;
+        let found = pump_multi(&mut self.lanes, deadline, |lane| {
+            let stream = lane.stream;
+            refill_into(&mut lane.buf, &mut lane.pos, |dst| {
+                dev.link.stream_read(stream, dst)
+            })
+        })?;
+        let Some((i, d)) = found else {
+            return Ok(None);
+        };
+        let lane = &self.lanes[i];
+        let frame = codec::Frame::parse(&lane.buf[d.start..d.end])
+            .expect("advance() validated these exact bytes and nothing has moved them since");
+        Ok(Some((
+            lane.stream,
+            Record {
+                frame,
+                lost: d.lost,
+            },
+        )))
+    }
+
+    /// One stream's sticky overrun and readable depth. Read AFTER the data, for the reason
+    /// [`StreamReader::health`] gives.
+    pub fn health(&mut self, s: Stream) -> Result<Health, Error> {
+        let v = self.dev.read_reg(stream_regs(s).2)?;
+        Ok(Health {
+            readable_bytes: (v & 0xFFFF) as usize * 4,
+            overrun: v & (1 << 16) != 0,
+        })
+    }
+
+    /// One stream's recovery counters, or `None` if this reader was not started with it.
+    pub fn stats(&self, s: Stream) -> Option<Stats> {
+        self.lanes
+            .iter()
+            .find(|l| l.stream == s)
+            .map(|l| l.dec.stats)
+    }
+
+    /// Stop every stream this reader started and release the device.
+    ///
+    /// Dropping instead leaves them ALL acquiring, for the same reason a single reader does.
+    pub fn stop(self) -> Result<(), Error> {
+        let mut first = Ok(());
+        // Every stream gets its stop attempted even if an earlier one failed: leaving a stream
+        // running because a different one errored is the worst of both outcomes.
+        for lane in &self.lanes {
+            let r = self.dev.write_field(stream_regs(lane.stream).0, 0);
+            if first.is_ok() {
+                first = r;
+            }
+        }
+        first
     }
 }
 
@@ -155,11 +314,9 @@ pub struct StreamReader<'d> {
     dec: Decoder,
 }
 
-/// The decode half of a reader: a pure function of the bytes it is handed, plus the running state
-/// the loss oracle needs. Split from the transport half ONLY so it can be driven from a test — the
-/// two behaviours that matter here (a corrupt frame is counted and resynced past; a frame split
-/// across two reads is carried, not lost) cannot be produced by a healthy device, so a conformance
-/// run says nothing about either.
+/// The decode half of a reader: a pure function of the bytes handed it, plus the running state the
+/// loss oracle needs. Split from the transport half ONLY so a test can drive it — a healthy device
+/// produces neither a corrupt frame nor a split one, so a conformance run says nothing about them.
 #[derive(Default)]
 struct Decoder {
     stats: Stats,
@@ -170,36 +327,28 @@ struct Decoder {
 }
 
 impl StreamReader<'_> {
-    /// The next record, or `None` if none arrived within `timeout`.
-    ///
-    /// Borrows `self`, so a record must be consumed before the buffer can refill — the zero-copy
-    /// guarantee is the compiler's, not a convention. A record is never returned twice and a whole
-    /// frame that arrived is never lost: those are the two defects the Python residue existed for.
+    /// The next record, or `None` if none arrived within `timeout`. Borrows `self`, so a record is
+    /// consumed before the buffer refills — the zero-copy guarantee is the compiler's. A record is
+    /// never returned twice and a whole frame never lost: the two defects the Python residue had.
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Record<'_>>, Error> {
         let deadline = Instant::now() + timeout;
-        let found = loop {
-            let (pos, hit) = self.dec.advance(&self.buf, self.pos);
-            self.pos = pos;
-            if let Some(f) = hit {
-                break Some(f);
-            }
-            let got = self.refill()?;
-            // Checked every iteration rather than only on an empty read: a device emitting steady
-            // garbage would otherwise keep this loop honest-looking and unbounded.
-            if Instant::now() >= deadline {
-                break None;
-            }
-            if got == 0 {
-                std::thread::sleep(POLL);
-            }
-        };
+        // Fields borrowed disjointly so the read closure may hold `dev` while `buf` is out, the
+        // same arrangement `refill_into` needs and for the same reason.
+        let dev = &mut *self.dev;
+        let stream = self.stream;
+        let found = pump(
+            &mut self.dec,
+            &mut self.buf,
+            &mut self.pos,
+            deadline,
+            |dst| dev.link.stream_read(stream, dst),
+        )?;
         let Some(d) = found else {
             return Ok(None);
         };
-        // A second parse of bytes `advance` already validated. It buys the borrow: a `Frame`
-        // borrows `buf`, and a loop that both refills `buf` and returns a borrow of it does not
-        // typecheck, so the loop trades in indices and the borrow is taken once, here. The cost is
-        // one extra CRC pass over one frame — table-driven, ~2 KB at the largest declared geometry.
+        // A second parse of bytes `advance` already validated. It buys the borrow: a `Frame` holds
+        // `buf`, and a loop that refills `buf` and returns a borrow of it does not typecheck. Cost:
+        // one extra CRC pass, table-driven, ~2 KB at the largest declared geometry.
         let frame = codec::Frame::parse(&self.buf[d.start..d.end])
             .expect("advance() validated these exact bytes and nothing has moved them since");
         Ok(Some(Record {
@@ -208,12 +357,9 @@ impl StreamReader<'_> {
         }))
     }
 
-    /// Backpressure and the sticky overrun.
-    ///
-    /// Read AFTER data, as the contract requires (`overrun_after_read`, kdi/contract.yaml:405-406):
-    /// the overrun is sticky since the last flush, so a pre-read check reports loss from before the
-    /// call. Checked after, it means exactly "the records this read returned may not be
-    /// contiguous", which is the only form a host can act on.
+    /// Backpressure and the sticky overrun. Read AFTER data, as the contract requires
+    /// (`overrun_after_read`, contract.yaml:108-108): it is sticky since the last flush, so a check
+    /// after the read means exactly "the records this read returned may not be contiguous".
     pub fn health(&mut self) -> Result<Health, Error> {
         let v = self.dev.read_reg(stream_regs(self.stream).2)?;
         Ok(Health {
@@ -237,14 +383,9 @@ impl StreamReader<'_> {
         self.dec.frame_bytes
     }
 
-    /// The largest burst `<= want` that a bounded capture may legally use, or the smallest legal
-    /// one. `None` until a frame has been seen.
-    ///
-    /// `burst_alignment` (kdi/contract.yaml:389-390) is a host obligation with a real failure: a
-    /// USB3 pipe read is a multiple of 16 bytes and a KDI frame usually is not (adio_dig is 88 B),
-    /// and a bounded capture has no next read to carry the remainder into — so an unaligned burst
-    /// leaves a partial group behind that nothing can retrieve. Applied on every binding, not just
-    /// usb3, because one host code path that is always right beats two that differ.
+    /// The largest burst `<= want` a bounded capture may legally use, or the smallest legal one;
+    /// `None` until a frame has been seen. A USB3 read is a multiple of 16 B and a frame usually is
+    /// not (adio_dig is 88 B), so an unaligned burst strands a group. Every binding (yaml:389-390).
     pub fn aligned_burst(&self, want: u16) -> Option<u16> {
         let n = codec::aligned_burst(
             self.dec.frame_bytes?,
@@ -255,39 +396,16 @@ impl StreamReader<'_> {
     }
 
     /// Clear this stream's run bit and give the [`Device`] back. Takes `self`, so the borrow ends
-    /// here and the device can start another stream.
-    ///
-    /// Dropping a reader instead leaves the device ACQUIRING — deliberately, because a drop cannot
-    /// report a failed register write and a silently half-stopped stream is worse than a running
-    /// one. [`Device::start`] stops the stream itself before arming it, so the next run is clean
-    /// either way.
+    /// here. Dropping instead leaves the device ACQUIRING, deliberately: a drop cannot report a
+    /// failed write, and a silent half-stop is worse than acquiring ([`Device::start`] stops it).
     pub fn stop(self) -> Result<(), Error> {
         self.dev.write_field(stream_regs(self.stream).0, 0)
     }
-
-    /// Drop what has been decoded, then append one transport read.
-    fn refill(&mut self) -> Result<usize, Error> {
-        // Fields borrowed disjointly so the read closure may hold `dev` while `buf` is out. That is
-        // the only reason the body below is a free function and not this one's.
-        let dev = &mut *self.dev;
-        let stream = self.stream;
-        refill_into(&mut self.buf, &mut self.pos, |dst| {
-            dev.link.stream_read(stream, dst)
-        })
-    }
 }
 
-/// Compact away what has been decoded, then append one transport read.
-///
-/// `drain(..pos)`, NEVER `clear()`. Everything from `pos` on is the CARRY — the head of a frame
-/// whose tail has not arrived — and dropping it loses that frame twice over: once as data, and
-/// again as a lie, because the next read then starts mid-frame, the walk resyncs, and a
-/// `bad_frames` count lands on the device for bytes the HOST threw away (the Python reference host).
-///
-/// Split out of [`StreamReader`] so it can be driven with no `Device` and no socket. It is not a
-/// hypothetical seam: mutating this `drain` to a `clear` passed the entire suite — unit tests,
-/// `--features conform`, clippy — because a partial frame is something a loopback UDP device model
-/// never produces and a 5 m SPI cable on USB3 produces constantly.
+/// Compact away what has been decoded, then append one transport read. `drain(..pos)`, NEVER
+/// `clear()`: from `pos` on is the CARRY, and dropping it charges the DEVICE a `bad_frames` for
+/// bytes the HOST threw away. Mutating it to `clear` passed the whole suite — UDP has no partials.
 fn refill_into(
     buf: &mut Vec<u8>,
     pos: &mut usize,
@@ -312,6 +430,82 @@ fn refill_into(
     Ok(got)
 }
 
+/// Decode-refill loop, transport as a closure so it can be driven with no device. THE RULE: a
+/// refill that produced bytes has earned a decode attempt, whatever the clock says — checking the
+/// deadline first made `next(ZERO)` report "nothing" holding 64 KB: 1 record per call, not 256.
+fn pump(
+    dec: &mut Decoder,
+    buf: &mut Vec<u8>,
+    pos: &mut usize,
+    deadline: Instant,
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, Error>,
+) -> Result<Option<Decoded>, Error> {
+    loop {
+        let (next, hit) = dec.advance(buf, *pos);
+        *pos = next;
+        if hit.is_some() {
+            return Ok(hit);
+        }
+        let got = refill_into(buf, pos, &mut read)?;
+        if got > 0 {
+            let (next, hit) = dec.advance(buf, *pos);
+            *pos = next;
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if got == 0 {
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// [`pump`] for several lanes, round-robin, refill as a closure so it needs no device. This loop
+/// CANNOT share `pump` — it advances every lane before refilling any — so the ordering rule lives
+/// twice, and once it was fixed only in `StreamReader`: `MultiReader::next(0)` saw a full refill.
+fn pump_multi(
+    lanes: &mut [Lane],
+    deadline: Instant,
+    mut refill: impl FnMut(&mut Lane) -> Result<usize, Error>,
+) -> Result<Option<(usize, Decoded)>, Error> {
+    // Every lane's decoder is advanced before any lane is refilled, so a fast stream cannot starve
+    // a slow one of attention.
+    fn scan(lanes: &mut [Lane]) -> Option<(usize, Decoded)> {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let (pos, d) = lane.dec.advance(&lane.buf, lane.pos);
+            lane.pos = pos;
+            if let Some(d) = d {
+                return Some((i, d));
+            }
+        }
+        None
+    }
+    loop {
+        if let Some(h) = scan(lanes) {
+            return Ok(Some(h));
+        }
+        let mut got = 0usize;
+        for lane in lanes.iter_mut() {
+            got += refill(lane)?;
+        }
+        if got > 0 {
+            // A refill that produced bytes has earned a decode attempt, whatever the clock says.
+            if let Some(h) = scan(lanes) {
+                return Ok(Some(h));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if got == 0 {
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
 /// One decode step's result: where the frame sits in the buffer it was decoded from, and how many
 /// records the device dropped before it.
 #[derive(Copy, Clone)]
@@ -322,14 +516,9 @@ struct Decoded {
 }
 
 impl Decoder {
-    /// Decode the next whole frame in `buf` at or after `from`. Returns the new cursor — everything
-    /// before it is returned or deliberately discarded, everything after it is the carry — and the
-    /// frame's bounds when there was one.
-    ///
-    /// Everything a rejected frame costs is accounted here and nowhere else: the frame is stepped
-    /// over (or resynced past, when its own declared length is what failed), counted, and the walk
-    /// continues. `Reject` never leaves this function — which is why `Error` has no decode variant
-    /// at all. A caller who wants to know reads `Stats`.
+    /// Decode the next whole frame in `buf` at or after `from`: the new cursor (before it is
+    /// returned or deliberately discarded, after it is the carry) and the frame's bounds if any.
+    /// A rejected frame is stepped over and counted here, never raised — a caller reads `Stats`.
     fn advance(&mut self, buf: &[u8], from: usize) -> (usize, Option<Decoded>) {
         let mut walk = Walk::new(&buf[from..]);
         let mut hit = None;
@@ -365,24 +554,9 @@ impl Decoder {
         self.stats.skipped_unknown_kind += c.unknown_kind as u64;
 
         let Some((ts, run_id, first, frame_words, len, cadence)) = hit else {
-            // A CARRY THIS LONG IS WRECKAGE, NOT A STRADDLING FRAME.
-            //
-            // `Walk` carries a frame whose declared extent runs past the blob instead of judging it
-            // (`codec/mod.rs:691-694`), which is right for a codec that must not care where a read
-            // boundary fell — and `kdi/frame.py` does the same, so `make kdi-difftest` compares the
-            // two on it. But `frame_words` is validated only for `% 4 == 0` and a floor, so bits
-            // 2..31 are free: one corrupted length declares a frame of up to 8 GB, this cursor
-            // parks at its base forever, the caller's compaction has nothing to remove, and the
-            // reader returns `None` for life while its buffer grows at line rate — with both damage
-            // counters reading zero. Measured before the bound: 202 frames in, 1 record out.
-            //
-            // The trigger is not exotic: `magic_is_anchor` lets a resync land on a false magic
-            // inside payload, and arbitrary bytes at the length offset clear those two gates about
-            // a quarter of the time.
-            //
-            // It lives HERE, not in the reader, because this function is already the one authority
-            // on where the cursor goes and what a rejected frame costs — a copy in `next()` is a
-            // second source, and a test could then pass while the shipping guard was deleted.
+            // A CARRY THIS LONG IS WRECKAGE, NOT A STRADDLING FRAME. `frame_words` is checked only
+            // for `% 4` and a floor, so a corrupt length can declare 8 GB and park this cursor for
+            // life, counters at zero: 202 frames in, 1 out. False magic does it 1 resync in 4.
             if buf.len() - pos > MAX_CARRY {
                 self.stats.bad_frames += 1;
                 self.stats.resync_bytes += 1;
@@ -405,14 +579,13 @@ impl Decoder {
         )
     }
 
-    /// The published `loss_oracle` (kdi/contract.yaml:396), applied within ONE stream — the only
+    /// The published `loss_oracle` (kdi/contract.yaml:185), applied within ONE stream — the only
     /// scope it is defined for. Streams are not co-sampled and share only the timebase, so the same
     /// arithmetic across two of them measures nothing.
     fn lost_before(&self, ts: u64, run_id: u16, first: bool, cadence: Option<(u32, u16)>) -> u64 {
-        // 0 for the first record of a run, and for the first after a new epoch: there is no
-        // previous timestamp in this segment for a gap to be measured against, and `first_of_run`
-        // says exactly that. A gap measured across a restart would report the whole idle period as
-        // lost data.
+        // 0 for the first record of a run and for the first after a new epoch: no previous stamp in
+        // this segment to measure a gap against, and `first_of_run` says exactly that. A gap
+        // across a restart would report the whole idle period as lost data.
         if first {
             return 0;
         }
@@ -438,7 +611,7 @@ pub struct Record<'a> {
 
 impl<'a> Record<'a> {
     /// Shared-timebase ticks. ONE free-running counter sampled per frame by every section, so
-    /// aligning two streams is exact integer subtraction (kdi/contract.yaml:300-313).
+    /// aligning two streams is exact integer subtraction (kdi/contract.yaml:97-97).
     pub fn timestamp(&self) -> u64 {
         self.frame.header().timestamp
     }
@@ -461,7 +634,7 @@ impl<'a> Record<'a> {
     }
 
     /// Every block this build understands. A kind it does not is SKIPPED, not an error — that is
-    /// what makes a KDI minor additive — and each skip is counted in [`Stats::skipped_unknown_kind`]
+    /// what makes a KDI minor additive — and each skip is counted in [`Stats`]
     /// so the silence is observable.
     pub fn blocks(&self) -> impl Iterator<Item = Block<'a>> + 'a {
         let f = self.frame;
@@ -472,14 +645,14 @@ impl<'a> Record<'a> {
     }
 
     /// The one block of this kind. `Ok(None)` = absent; `Err` = the frame carries more than one,
-    /// which is LEGAL (`dup_kinds_ok`, kdi/contract.yaml:394), so a singular accessor must refuse
+    /// which is LEGAL (`dup_kinds_ok`, kdi/contract.yaml:108), so a singular accessor must refuse
     /// rather than return half the data.
     pub fn block(&self, kind: Kind) -> Result<Option<Block<'a>>, Error> {
         match self.frame.section(kind.code()) {
             Ok(sec) => Ok(sec.map(|sec| Block { sec, kind })),
             // `ambiguous_kind` is in `host_reject_tokens`, not `reject_tokens`: the FRAME is valid
             // and this is host-API misuse, so it must never be counted against the device
-            // (kdi/contract.yaml:438-443).
+            // (kdi/contract.yaml:149-153).
             Err(a) => Err(io_err(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -544,20 +717,9 @@ impl<'a> Block<'a> {
         self.sec.lane_ids().position(|x| x == id).map(|i| i as u16)
     }
 
-    /// Amplifier channel `channel` of physical lane `lane` (an id from [`Block::lanes`]).
-    /// rhd_matrix only; `None` for any other kind, or if that lane is not in this block.
-    ///
-    /// THE ROW ORDER IS ROTATED BY ONE and that is a property of the hardware, not a choice: the
-    /// RHD SPI returns a command's result during the NEXT command, so row k carries the capture
-    /// from command k-1 (`RhdCore.scala:218`, kind 0x20). Row 0 is the PREVIOUS timestep's aux2,
-    /// rows 1..32 are amplifier channels 0..31, rows 33/34 are this timestep's aux0/aux1. A host
-    /// that assumes rows 0..31 are the amplifier reads channel n at row n and gets channel n-1 with
-    /// row 0 pure garbage — plausible-looking neural data at the wrong index, which is exactly the
-    /// failure PR #15 shipped once. Doing that arithmetic ONCE, here, is the single biggest thing
-    /// this layer exists for.
-    ///
-    /// Codes are offset binary around 0x8000, NOT two's complement. The volts-per-code scale is a
-    /// property of the chip profile and is deliberately not published, so this does not convert.
+    /// Amplifier channel `channel` of physical lane `lane`, rhd_matrix only. ROWS ARE ROTATED BY
+    /// ONE: SPI returns each result during the NEXT command, so row 0 is the previous aux2, rows
+    /// 1..32 are channels 0..31, 33/34 aux0/aux1 (`RhdCore.scala:136`, PR #15). Offset binary.
     pub fn amplifier(&self, channel: u8, lane: u16) -> Option<u16> {
         if self.kind != Kind::RhdMatrix || channel > 31 {
             return None;
@@ -623,12 +785,9 @@ pub struct Health {
     pub overrun: bool,
 }
 
-/// What the reader had to recover from, cumulative over the life of the stream.
-///
-/// `bad_frames` is where a decode rejection ends up, and it is the whole reason [`Error`] has no
-/// decode variant: a rejected frame is a fact about the link's quality, not a reason to abandon a
-/// recording, and a caller who wants to act on it reads a counter rather than catching an error in
-/// the middle of a loop that is otherwise about data.
+/// What the reader had to recover from, cumulative over the life of the stream. `bad_frames` is
+/// where a decode rejection ends up, and the whole reason [`Error`] has no decode variant: a
+/// rejected frame is a fact about the link's quality, not a reason to abandon a recording.
 #[derive(Copy, Clone, Default, Debug)]
 pub struct Stats {
     /// Records handed back by [`StreamReader::next`].
@@ -651,11 +810,8 @@ pub struct Stats {
 }
 
 // ─────────────────────────────────────────────────────────────────────── checks
-//
 // The two behaviours a conformance run cannot exercise, because a healthy device produces neither:
-// a corrupt frame, and a frame split across two transport reads. Both are the whole reason this
-// module exists, and both are silent when wrong — a dropped frame looks like a device that emitted
-// fewer, and a lost carry looks like a stream with a high `bad_frames` rate.
+// a corrupt frame, and a frame split across two reads — silent: loss looks like a quiet device.
 
 #[cfg(test)]
 mod tests {
@@ -729,27 +885,16 @@ mod tests {
         }
     }
 
-    /// A corrupt frame must be COUNTED and stepped over, never returned and never fatal — and the
-    /// frames after it must still arrive. The Python reference raised out of `walk()`, which
-    /// destroys every frame already decoded plus the tail (the Python reference host).
-    /// A frame whose DECLARED LENGTH is corrupt, which is a different failure from a corrupt body.
-    ///
-    /// A bad CRC is resyncable and the test below covers it. A bad `frame_words` is not: the walk
-    /// carries it, the cursor parks on it, and without the bound in `next()` the reader is wedged
-    /// for life with both damage counters reading zero — a silent, unbounded leak that looks like a
-    /// device that stopped talking.
-    ///
-    /// Drives `advance` + the compaction in `next()`'s ORDER, because that ordering is the defect:
-    /// each piece is individually correct and no other test puts them together.
+    /// A corrupt frame must be COUNTED and stepped over, never returned or fatal, and the frames
+    /// after it must still arrive. A bad CRC resyncs; a bad `frame_words` does not — without the
+    /// bound the reader wedges for life, counters at zero. Drives `advance` in `next()`'s ORDER.
     #[test]
     fn a_corrupt_length_cannot_wedge_the_reader() {
         let mut wire = frame(1000, 1, true, 0x1111);
         let mut bad = frame(1100, 1, false, 0x2222);
-        // Legal-looking: still a multiple of 4, still above the floor, just enormous. Addressed by
-        // `c::OFF_FRAME_WORDS`, not a literal — the first cut of this test wrote 8, which is
-        // OFF_TIMESTAMP, so it corrupted the stamp instead of the length and passed with the bound
-        // disabled. A test for a length bug that does not corrupt the length is the exact shape of
-        // failure this file's neighbours exist to catch.
+        // Legal-looking: a multiple of 4, above the floor, just enormous. Addressed by
+        // `c::OFF_FRAME_WORDS`, not a literal: the first cut wrote 8 (OFF_TIMESTAMP), corrupting
+        // the stamp instead of the length and passed with the bound disabled.
         let at = c::OFF_FRAME_WORDS;
         let words = u32::from_le_bytes(bad[at..at + 4].try_into().unwrap()) | (1 << 28);
         bad[at..at + 4].copy_from_slice(&words.to_le_bytes());
@@ -823,12 +968,9 @@ mod tests {
         assert_eq!(dec.stats.records, 2);
     }
 
-    /// A frame straddles two transport reads routinely. The bytes of the first half must be CARRIED
-    /// — not consumed, not re-returned once the rest arrives.
-    ///
-    /// This is the DECODE half only: it proves `advance` leaves the cursor in front of the partial
-    /// frame. Whether the buffer then survives a refill is `refill_into`'s, and is asserted
-    /// separately below — splitting them is what an adversarial mutation run cost to learn.
+    /// A frame straddles two transport reads routinely: the first half must be CARRIED, not eaten
+    /// and not re-returned. The DECODE half only — that `advance` leaves the cursor in front of the
+    /// partial frame; whether the buffer survives a refill is asserted separately below.
     #[test]
     fn a_frame_split_across_two_reads_is_carried_not_lost() {
         let a = frame(1000, 1, true, 0x1111);
@@ -851,13 +993,9 @@ mod tests {
         assert_eq!(dec.frame_bytes, Some(64));
     }
 
-    /// The TRANSPORT half of the carry rule, and the one no other test in this repo reaches: a
-    /// refill must compact away what was returned and nothing else.
-    ///
-    /// Found by mutation: replacing `refill_into`'s `drain(..pos)` with `clear()` — the Python
-    /// residue defect, exactly — passed `cargo test --workspace`, `--features conform` against the
-    /// device model, and clippy. It has to be asserted here because a loopback UDP model hands back
-    /// whole frames, so the only witness to the bug is a split that a local model cannot stage.
+    /// The TRANSPORT half of the carry rule, reached by no other test here: a refill must compact
+    /// away what was returned and nothing else. Found by mutation — `drain(..pos)` → `clear()`, the
+    /// Python residue defect exactly, passed the workspace, `--features conform` and clippy.
     #[test]
     fn refill_compacts_only_what_was_decoded() {
         let a = frame(1000, 1, true, 0x1111);
@@ -901,6 +1039,99 @@ mod tests {
         // The counter that would have lied: a dropped carry resyncs, and charges the device.
         assert_eq!(dec.stats.bad_frames, 0);
         assert_eq!(dec.stats.records, 2);
+    }
+
+    /// A zero timeout must still decode what the refill it performed just returned — the shape a
+    /// batching host uses ("everything resident, do not wait"). The old ordering answered `None`
+    /// holding both frames: one record per call. Mutating `pump` fails this at the first assert.
+    #[test]
+    fn a_zero_timeout_still_decodes_what_the_refill_returned() {
+        let a = frame(2000, 1, true, 0xAAAA);
+        let b = frame(2100, 1, false, 0xBBBB);
+        let whole: Vec<u8> = a.iter().chain(&b).copied().collect();
+
+        let (mut buf, mut pos) = (Vec::new(), 0usize);
+        let mut dec = Decoder::default();
+        let mut served = false;
+
+        // Already expired: the caller is asking for whatever can be produced without waiting.
+        let deadline = Instant::now();
+        let mut read = |dst: &mut [u8]| {
+            if served {
+                return Ok(0);
+            }
+            served = true;
+            dst[..whole.len()].copy_from_slice(&whole);
+            Ok(whole.len())
+        };
+
+        let first = pump(&mut dec, &mut buf, &mut pos, deadline, &mut read)
+            .expect("read 1")
+            .expect("the refill returned two whole frames; one of them is due now");
+        let f = c::Frame::parse(&buf[first.start..first.end]).expect("pump validated it");
+        assert_eq!(
+            f.section_at(0).unwrap().element(0, 0).unwrap() as u16,
+            0xAAAA
+        );
+
+        // The second is already in `buf`, so it needs no transport at all.
+        let second = pump(&mut dec, &mut buf, &mut pos, deadline, &mut read)
+            .expect("read 2")
+            .expect("the second frame was resident before the call");
+        let f = c::Frame::parse(&buf[second.start..second.end]).expect("pump validated it");
+        assert_eq!(
+            f.section_at(0).unwrap().element(0, 0).unwrap() as u16,
+            0xBBBB
+        );
+
+        // Genuinely empty now: an expired deadline must not spin.
+        assert!(pump(&mut dec, &mut buf, &mut pos, deadline, &mut read)
+            .expect("read 3")
+            .is_none());
+    }
+
+    /// The SAME rule, on the multi-stream loop, which cannot share `pump`. Drives `pump_multi`
+    /// directly — a real `MultiReader` needs a `Device` and a socket. An earlier cut called `pump`,
+    /// which would have passed with `pump_multi` still checking its deadline first.
+    #[test]
+    fn the_multi_stream_loop_also_decodes_what_the_refill_returned() {
+        let payloads = [0xC0DEu16, 0xF00D];
+        let mut lanes: Vec<Lane> = [Stream::Samples, Stream::Digital]
+            .iter()
+            .map(|&stream| Lane {
+                stream,
+                buf: Vec::new(),
+                pos: 0,
+                dec: Decoder::default(),
+            })
+            .collect();
+        let frames: Vec<Vec<u8>> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| frame(3000 + i as u64, 1, true, p))
+            .collect();
+
+        let mut served = [false, false];
+        let deadline = Instant::now(); // already expired: "do not wait", not "do not look"
+        let hit = pump_multi(&mut lanes, deadline, |lane| {
+            let i = usize::from(lane.stream != Stream::Samples);
+            if served[i] {
+                return Ok(0);
+            }
+            served[i] = true;
+            let f = &frames[i];
+            lane.buf.extend_from_slice(f);
+            Ok(f.len())
+        })
+        .expect("read")
+        .expect("a refill that produced whole frames must not be reported as no-data");
+
+        let (i, d) = hit;
+        let f = c::Frame::parse(&lanes[i].buf[d.start..d.end]).expect("validated");
+        assert_eq!(
+            f.section_at(0).unwrap().element(0, 0).unwrap() as u16,
+            payloads[i]
+        );
     }
 
     /// `first_of_run` is the one case where a timestamp gap is NOT loss: the stream was stopped.

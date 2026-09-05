@@ -1,40 +1,22 @@
-# The KDI customer SDK in Rust.
-#
-# ITS OWN WORKSPACE, deliberately separate from this project's firmware crates. Those are rv32imc:
-# they carry a `[patch.crates-io] zephyr` table, kv-logic pins `[profile.release] panic = "abort"`
-# (a workspace-level setting, so it would silently apply here), and sw/zephyr/lib/CMakeLists.txt
-# links a literal `target/riscv32imc-.../libkv_logic.a` path that a workspace target dir would move.
-# A host library has none of those constraints and should not inherit them.
+# The KDI customer SDK in Rust. ITS OWN WORKSPACE, apart from the rv32imc firmware crates: they
+# carry a `[patch.crates-io] zephyr` table, kv-logic's workspace-level `panic = "abort"` would
+# apply here, and sw/zephyr/lib/CMakeLists.txt links a literal `target/riscv32imc-...` path.
 [workspace]
 resolver = "2"
 members = ["kdi"]
 
 [workspace.package]
-# The crate version tracks the KDI contract version, not the repo's release tag
-# The crate asserts at COMPILE TIME that this equals the
-# generated KDI_VERSION, so a publish cannot ship a crate that disagrees with the contract it
-# claims to implement.
+# Tracks the KDI CONTRACT version, not the repo's release tag; asserted equal to the generated
+# KDI_VERSION at COMPILE TIME, so a publish cannot disagree with the contract it claims.
 version = "0.5.0"
 edition = "2021"
 # The toolchain these crates are ACTUALLY built and tested with (`rust-toolchain.toml` pins the
-# same). It was 1.75 and that was a promise nothing checked — the comment here said so in as many
-# words, "a 1.76+ feature would land unnoticed", and then one did: a `c"..."` literal (1.77) sat in
-# `usb3.rs` until it was spotted by eye. An MSRV is a compatibility promise to a customer, and one
-# no job verifies is worse than none, because it will be broken silently and someone will plan
-# around it.
-#
-# So this now states what is true rather than what would be nice. Lowering it again is a real
-# decision and costs a real mechanism: a CI job that builds at that version. Do not lower it
-# without adding one.
+# same). It was 1.75, checked by nothing, and a `c"..."` literal (1.77) sat in `usb3.rs` unspotted.
+# Lowering it again needs a CI job that builds at it; an unverified MSRV is worse than none.
 rust-version = "1.97.1"
-# Apache-2.0, ratified for external release. The bundled device drivers under `vendor/` are NOT
-# covered by it -- they are third-party binaries, and they statically embed Lua 5.3.1 (MIT).
-# Both are attributed in NOTICE, which ships with the crate; `license` describes OUR code.
-# An SPDX EXPRESSION, not a single id, because this package is not one thing. Our code is
-# Apache-2.0; the bundled device drivers under `vendor/` are proprietary third-party binaries
-# with no SPDX id, which is what `LicenseRef-` exists for; and those binaries statically embed
-# Lua 5.3.1, whose MIT notice we are obliged to reproduce (it is in NOTICE). Declaring the bare
-# `Apache-2.0` claimed that licence over 8.2 MB of bytes we do not own.
+# An SPDX EXPRESSION, not one id: our code is Apache-2.0, the `vendor/` device drivers are
+# proprietary third-party binaries (no SPDX id) that statically embed Lua 5.3.1 (MIT), attributed
+# in NOTICE. Bare `Apache-2.0` claimed that licence over 8.2 MB of bytes we do not own.
 license = "Apache-2.0 AND MIT AND LicenseRef-proprietary-device-driver"
 # Both point at the umbrella repo, which holds the contract in `spec/` and this crate's source
 # in `rs/`. `repository` was omitted while the only public repo was the contract: crates.io

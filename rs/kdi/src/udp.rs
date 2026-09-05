@@ -1,11 +1,6 @@
-//! The UDP reference binding (`bindings.udp`, kdi/contract.yaml:660-679).
-//!
-//! Its peer is the reference implementation's software device model, which is not distributed
-//! with this crate. Published rather than left
-//! implicit because it is the peer every non-Python implementation tests against with no hardware:
-//! an undocumented test transport makes the conformance suite unreproducible outside this repo.
-//!
-//! Names are the wire here — an identity map — so this binding resolves no addresses at all.
+//! The UDP reference binding (`bindings.udp`, kdi/contract.yaml:145-153). Its peer is the reference
+//! software device model — not shipped here, but documented because it is what every non-Python
+//! implementation tests against with no hardware. Names are the wire: no address resolution at all.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
@@ -18,15 +13,9 @@ use std::io;
 /// One request datagram -> one reply datagram, max 65535 B (`bindings.udp.rpc.framing`).
 const MAX_DGRAM: usize = 65535;
 
-/// The abstract request envelope's `args` is an OBJECT KEYED BY ARGUMENT NAME (the Python reference host,
-/// the Python reference host); only the vUART line is positional, and flattening one into the other
-/// is that binding's job (the Python reference host). A JSON ARRAY here validated as an envelope
-/// with NO arguments at all, so every argumented command over this binding answered
-/// `bad_args`/`missing` — which reads exactly like a rejected value, and the conformance test that
-/// asserted only the token passed on it.
-///
-/// The names come from the generated `COMMANDS`, in declared order, so there is no second copy of
-/// the registry to go stale (`request.arg_order: declared`, kdi/contract.yaml:770).
+/// Envelope `args` is an OBJECT KEYED BY NAME; only the vUART line is positional. As a JSON
+/// ARRAY it validates with NO args, so every argumented command answered `bad_args`/`missing`.
+/// Names come from the generated `COMMANDS`, in declared order (contract:770).
 fn named(name: &str, args: &[&str]) -> Value {
     // Unknown command, or more arguments than it declares: hand the envelope over as-is. The
     // device answers `unknown_cmd` before it looks at arguments, and a surplus argument must reach
@@ -82,7 +71,7 @@ impl Udp {
         match self.sock.recv(&mut self.rx) {
             Ok(n) => Ok(n),
             // One rule, one definition. `io_or_timeout` maps a read deadline to `host_timeout` —
-            // the closed set's token, never a minted one (`contract.yaml:90-94`) — and everything
+            // the closed set's token, never a minted one (`contract.yaml:36-37`) — and everything
             // else to `Io`. `simlink.rs` had its own copy of exactly this.
             Err(e) => Err(crate::io_or_timeout(e)),
         }
@@ -96,10 +85,9 @@ impl Udp {
                 format!("undecodable reply: {e}"),
             )
         })?;
-        // ANY op may answer `{"err": token}` (kdi/contract.yaml:673-676). These are the
-        // register-drawer tokens — `no_such_register`, `ro_register` — which are host bugs, not
-        // device data: unlike a command reply there is no `rc`, no id and nothing to act on, so
-        // they surface as an error rather than as an `Ok`.
+        // ANY op may answer `{"err": token}` (kdi/contract.yaml:153-153). These register-drawer
+        // tokens — `no_such_register`, `ro_register` — are host bugs, not device data: no `rc`, no
+        // id, nothing to act on, so they surface as an error rather than as an `Ok`.
         if let Some(t) = v.get("err").and_then(Value::as_str) {
             return Err(io_err(
                 io::ErrorKind::InvalidData,
@@ -170,26 +158,9 @@ impl Udp {
         }
     }
 
-    /// The abstract request envelope `{id, name, args}` (kdi/contract.yaml:498-510).
-    ///
-    /// ARGS GO BY NAME on this binding, because the envelope's `args` is an OBJECT keyed by
-    /// argument name — that is what the reference device validates against
-    /// (the Python reference host). Only the usb3 line form is positional, and the two are different
-    /// encodings of the same declared order.
-    ///
-    /// This was an array once, and the failure is worth keeping: every argumented command answered
-    /// `bad_args` with `why: missing`, while the conformance test asserted only `err == bad_args`
-    /// and so passed on entirely the wrong reason. The names come from the generated `COMMANDS`
-    /// registry, which exists precisely so the order lives in one place; a command the registry
-    /// does not know still goes as an array, so the device rejects it rather than a `zip` silently
-    /// dropping arguments.
-    ///
-    /// `token` is an ENVELOPE KEY — a sibling of `id`/`name`/`args`, never a member of `args`
-    /// (kdi/contract.yaml:499-506). Inside `args` it would be validated as an undeclared argument
-    /// and the command rejected; omitted entirely, the device refuses every command that is not
-    /// `safety: ro` with `not_claimed` (the Python reference host). It is sent on every request,
-    /// including the claim that mints the lease, exactly as the reference does
-    /// (the Python reference host).
+    /// The request envelope `{id, name, args}` (kdi/contract.yaml:108-108); `args` goes by NAME
+    /// here (see `named`). `token` is an ENVELOPE KEY, never inside `args` (:499-506): inside
+    /// it is undeclared; omitted, every non-ro command answers `not_claimed`. Always sent.
     pub(crate) fn message(
         &mut self,
         id: &str,
@@ -209,7 +180,7 @@ impl Udp {
         })?;
         let reply = reply_from(resp)?;
         // Correlate, always. A late reply from a previously timed-out command must never be
-        // returned as this command's answer (`response.rules`, kdi/contract.yaml:788-792) — on a
+        // returned as this command's answer (`response.rules`, kdi/contract.yaml:204-208) — on a
         // datagram wire that is a stray reply the kernel queued, not a theoretical case.
         if reply.id != id {
             return Err(io_err(

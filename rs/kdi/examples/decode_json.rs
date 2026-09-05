@@ -1,38 +1,14 @@
-//! Decode a KDI blob and print what THIS codec saw, as JSON — the Rust half of the
-//! cross-implementation differential harness (the Python reference host).
-//!
-//! WHY AN EXAMPLE RATHER THAN A TEST. The comparator has to run both decoders over bytes that
-//! exist only for the length of one seeded run, so the Rust side has to be a program a Python
-//! process can hand bytes to; `cargo test` cannot be that. And it calls `kdi::codec` rather than
-//! in `kdi` because the claim under test is the NORMATIVE decoder's — routing it through the host
-//! crate would add a layer (this crate's stream layer) that the Python reference host has no counterpart for,
-//! so a disagreement could no longer be attributed.
-//!
-//! Usage:
-//!   decode_json < blob          one JSON object on stdout
-//!   decode_json FILE [FILE..]   one JSON object per line, in argv order
-//!   decode_json DIR             every `*.bin` in DIR, sorted — what difftest.py passes
-//!
-//! THIS PRINTS A DESCRIPTION, NEVER A VERDICT: every header field, every descriptor, every element
-//! value, the three walk counters, the tail length, and for a rejected frame the contract's exact
-//! token plus the byte offset it was found at. Any judgement made here (skipping a field, deciding
-//! two shapes are "equivalent") is a judgement the diff can no longer see, which is how a
-//! differential harness turns into a harness that agrees with itself.
-//!
-//! One asymmetry is structural and belongs in the comparator, not here: [`Walk`] yields a rejected
-//! frame as ONE `Err` item and carries on, while `kdi.frame.walk` raises and loses everything it
-//! had already decoded (the Python reference host; the judgement is argued at
-//! `kdi/rs/kdi/src/codec/mod.rs:602-609`). So the items array can hold frames AFTER a reject;
-//! difftest.py compares the first reject and says so.
+//! Decode a KDI blob and print what THIS codec saw, as JSON — the Rust half of the differential
+//! harness: `decode_json [FILE|DIR]...`, or a blob on stdin, one JSON object per line. It calls
+//! `kdi::codec` because the claim under test is the NORMATIVE decoder's, and it never judges.
 
 use kdi::codec::{check_run_announcements, Frame, Header, Walk};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 
-/// Everything one frame carries, flat enough that a field-by-field diff can name what differs.
-/// `values` is materialised through [`kdi::codec::Section::row`] rather than read out of `body()`:
-/// the element ACCESSOR is what row-major order is a property of, and dumping the raw body would
-/// compare the bytes Python encoded with the bytes Python encoded (contract.yaml:250-256).
+/// Everything one frame carries, flat enough for a field-by-field diff. `values` goes through
+/// [`kdi::codec::Section::row`], never `body()`: row-major order is a property of the ACCESSOR,
+/// raw bytes would compare Python's encoding with itself (contract.yaml:184-190).
 fn frame_value(f: &Frame) -> Value {
     let h = f.header();
     let sections: Vec<Value> = f
@@ -80,9 +56,9 @@ fn decode_value(path: &str, blob: &[u8]) -> Value {
                 headers.push(*f.header());
                 items.push(json!({ "frame": frame_value(&f) }));
             }
-            // The offset is blob-relative and points at the FIELD that failed. Python's `walk`
-            // raises a `FrameError` carrying only the token (`kdi/frame.py:57-62`), so the
-            // comparator can diff the token and not this — it is printed for the human replaying.
+            // The offset is blob-relative, at the FIELD that failed; Python's `walk` raises a
+            // `FrameError` with only the token (`kdi/frame.py:4-4`) and loses what it
+            // decoded, so `items` holds frames AFTER a reject and difftest.py diffs the first.
             Err(e) => items.push(json!({"reject": {
                 "reason": e.reason.token(),
                 "offset": e.offset,
@@ -101,7 +77,7 @@ fn decode_value(path: &str, blob: &[u8]) -> Value {
         "tail_bytes": walk.tail().len(),
         // The one CROSS-FRAME rule. Python runs it inside `walk` and raises; here it is a separate
         // call over the accepted headers so a decoder's verdict cannot depend on chunk size
-        // (`kdi/rs/kdi/src/codec/mod.rs:719-728`). Reported as a token so the two are comparable.
+        // (`kdi/rs/kdi/src/codec/mod.rs:474-488`). Reported as a token so the two are comparable.
         "run_announcements": match check_run_announcements(&headers) {
             Ok(()) => "ok",
             Err(r) => r.token(),

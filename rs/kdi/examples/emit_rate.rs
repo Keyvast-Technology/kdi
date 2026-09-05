@@ -1,20 +1,6 @@
-//! Does the DEVICE emit sparsely, or does the HOST lose frames? (#131)
-//!
-//! ```text
-//! cargo run --features usb3 --example emit_rate -- [serial]
-//! ```
-//!
-//! The measurement that started #131 read a 20x timestamp gap between delivered records and called
-//! it a rate. It is not decidable from that number: `lost_before` is DERIVED FROM TIMESTAMPS, so it
-//! restates the gap rather than corroborating any cause, and both stories predict it exactly.
-//!
-//! This decides it by never reading the pipe. Start the stream, leave the data where it is, and
-//! watch the device's own FIFO fill:
-//!
-//! * emitting at the full rate -> the FIFO saturates almost immediately and `overrun` sets;
-//! * emitting one frame in twenty -> it fills about twenty times slower.
-//!
-//! Host transport cannot influence either number, because the host is not reading.
+//! Does the DEVICE emit sparsely, or does the HOST lose frames? (#131) Not decidable from the 20x
+//! timestamp gap that started it — `lost_before` is DERIVED FROM TIMESTAMPS. So never read the pipe
+//! and watch its FIFO: full rate saturates it and sets `overrun`; one in 20 is 20x slower.
 
 use std::process::ExitCode;
 use std::thread::sleep;
@@ -22,10 +8,9 @@ use std::time::{Duration, Instant};
 
 use kdi::{Acquisition, Device, Stream};
 
-/// A BOUNDED burst small enough that the pipe cannot overflow: 16 frames x 110 B = 1760 B against a
-/// FIFO measured at 4096 B. The device emits exactly 16 and stops, so no frame can be lost in
-/// transport or dropped on the floor -- whatever the timestamps say is the device's own emission
-/// cadence, with the host removed from the question entirely.
+/// A BOUNDED burst the pipe cannot overflow: 16 frames x 110 B = 1760 B against a FIFO measured at
+/// 4096 B. The device emits exactly 16 and stops, so nothing can be lost in transport: the
+/// timestamps are the device's own emission cadence, with the host removed from the question.
 fn probe(dev: &mut Device, label: &str) -> Result<(), String> {
     const N: u16 = 16;
     let mut rd = dev

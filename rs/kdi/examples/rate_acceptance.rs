@@ -1,38 +1,21 @@
-//! The silicon acceptance for #131 (docs/kdi_rate_and_validity.md §7).
-//!
-//! ```text
-//! cargo run --features usb3 --example rate_acceptance -- [serial]
-//! ```
-//!
-//! Every check runs after a `ConfigureFPGA` with **no other host action**, because the whole defect
-//! is about what a device does before anyone configures it. A green sim proves nothing here: every
-//! failed attempt at this bug passed its sims.
-//!
-//! Exit 0 = all checks passed.
+//! The silicon acceptance for #131 (docs/kdi_rate_and_validity.md §7): `rate_acceptance [serial]`,
+//! exit 0 = all checks passed. Every check runs after a `ConfigureFPGA` with **no other host
+//! action** — the defect is what a device does before configuration; every failed fix passed sims.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use kdi::{Acquisition, Cap, Device, Stream};
 
-/// The EXPLICIT table entry for 30 kS/s, not `0, 0`. Both reach the same state -- an off-table pair
-/// falls through to the default -- but the fall-through makes "which rate did we ask for" a second
-/// question during a measurement that is already about rates, and the first run of this check was
-/// read with that ambiguity in it.
+/// The EXPLICIT table entry for 30 kS/s, not `0, 0`. Both reach the same state — an off-table pair
+/// falls through to the default — but the fall-through makes "which rate did we ask for" a second
+/// question inside a measurement about rates; the first run was read with that ambiguity in it.
 const M: u8 = 42;
 const D: u8 = 25;
 
-/// ONE LANE, and a bounded burst.
-///
-/// The first version of this check asked for all 32 lanes free-running and measured a gap of
-/// 33750 ticks against a declared 3375 -- a clean factor of ten that looked exactly like a rate
-/// defect. It was not: 32 lanes x 35 rows x 2 B at 30 kS/s is ~66 MB/s, which this pipe does not
-/// sustain, so the records that survive are spaced ten timesteps apart. The measurement was
-/// wrong, not the device.
-///
-/// `lost_before` is summed and reported for the same reason: an interval measurement over frames
-/// that were dropped between reads is an interval between the wrong pair of frames, and if nothing
-/// prints the loss it reads as a rate.
+/// ONE LANE, bounded. All 32 lanes free-running measured a gap of 33750 vs a declared 3375 — not
+/// a rate defect: 32 x 35 rows x 2 B at 30 kS/s is ~66 MB/s, which this pipe cannot sustain, so
+/// survivors sit ten timesteps apart. `lost_before` is summed too: unprinted loss reads as a rate.
 const LANES: u32 = 1;
 
 /// One frame's `(timestamp, tick_num, tick_den)`. Named because clippy is right that the tuple was
@@ -152,10 +135,9 @@ fn main() -> ExitCode {
         }
     }
 
-    // 3. THE PUBLISHED CADENCE IS THE MEASURED ONE, ACROSS THE TABLE. Each rate is judged against
-    //    the cadence THAT FRAME DECLARES, never a host-side constant -- a host-side constant is
-    //    what let #131 stand, because the device and the host agreed with each other and both were
-    //    wrong. This is the check that would have caught it on day one.
+    // 3. THE PUBLISHED CADENCE IS THE MEASURED ONE, ACROSS THE TABLE. Judged against the cadence
+    //    THAT FRAME DECLARES, never a host-side constant: a constant is what let #131 stand, with
+    //    device and host agreeing and both wrong. This check would have caught it on day one.
     for (m, d, label) in [
         (7u8, 125u8, "1 kS/s"),
         (14, 25, "10 kS/s"),

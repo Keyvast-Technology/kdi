@@ -3,26 +3,32 @@
   "kdi": "0.5",
   "compatible": "keyvast-a75",
   "gateware": {
-    "git_sha": "software",
+    "git_sha": "015143f",
     "build_unix": 0,
-    "dirty": false
+    "dirty": false,
+    "note": "software reference + usb3 binding (see the compatibility matrix)"
   },
   "artifacts": [
     {
       "name": "descriptor.json",
-      "size": 54752,
-      "checksum": "sha256:39832000d1c0b1c28d7cd072568449673533b93c540b367ff336bbcdbf77c5b7"
+      "size": 54902,
+      "checksum": "sha256:9c08a17a2835907c861f20dbacee951986e8846faad7a1b62be38a1e5e6daf62"
     },
     {
       "name": "schema.json",
       "size": 3627,
       "checksum": "sha256:d050223f3b134da28dc638dc9e724b49da591461da2694118a5115f28ed51969"
+    },
+    {
+      "name": "KDI-0.5.md",
+      "size": 35166,
+      "checksum": "sha256:48ccd51a7f15a0276173f73c8d4a444228f2941c7c58e1f4bec228de9ebf179d"
     }
   ],
   "conformance": {
     "status": "pass",
-    "passed": 14,
-    "total": 14,
+    "passed": 15,
+    "total": 15,
     "target": "software-reference",
     "note": "kdi.conform against the software device; NOT a gateware result"
   },

@@ -13,19 +13,9 @@ repository.workspace = true
 documentation = "https://docs.rs/kdi"
 keywords = ["instrument", "acquisition", "neuroscience", "sdk", "usb3"]
 categories = ["science", "hardware-support", "api-bindings"]
-# WITHOUT THIS THE PUBLISHED CRATE SHIPS NO DRIVER, and silently.
-#
-# `vendor/*.bin` is .gitignore'd — fetched by `make vendor-drivers`, not tracked. With no `include`,
-# cargo enumerates a package through git and DROPS VCS-ignored files, so the tarball would carry no
-# `vendor/` at all. Nothing would notice: `default = []`, so `cargo package`'s verify build never
-# compiles `bundled` and never reaches `include_bytes!`. The breakage appears only on a customer's
-# `--features bundled` build.
-#
-# Measured, and the measurement is the point: in CI, where cargo has a working git view,
-# `cargo package --list` reported 0 `vendor/driver-*` entries. On a developer box whose container
-# mount hides `.git` (this repo is checked out as a git WORKTREE, so `.git` is a file pointing
-# elsewhere) cargo falls back to a directory walk and reports 4 — so a local check here is not
-# evidence. `.github/workflows/kdi.yml`'s "The packaged crate carries the drivers" step is.
+# WITHOUT THIS THE PUBLISHED CRATE SHIPS NO DRIVER, silently: `vendor/*.bin` is gitignored, and
+# with no `include` cargo enumerates via git and DROPS ignored files — unnoticed: `default = []`
+# never reaches `include_bytes!`. `package --list` lies in a worktree; kdi.yml's step is proof.
 include = [
     "src/**/*.rs",
     "examples/**/*.rs",
@@ -35,32 +25,14 @@ include = [
     "README.md",
     "Cargo.toml",
 ]
-# `tests/` IS DELIBERATELY NOT SHIPPED, and dropping it is a publish blocker fix, not tidying.
-# `tests/vendor_neutral.rs` is the guard that keeps the board vendor's name out of anything a
-# customer reads, so its fixtures ARE the forbidden strings -- and it exempts itself from its own
-# scan, which is right for an in-repo guard and catastrophic in a tarball: CI stays green while the
-# published crate carries the manufacturer's name, the board model and a bench instrument's serial.
-# Independently, three of the suites read paths outside the crate root and cannot pass from a
-# tarball at all, so shipping them published tests that were guaranteed to fail.
-# THE GUARD MOVED, it was not removed. `publish = false` made an accidental `cargo publish`
-# impossible rather than unlikely, and that mattered while the licence was an open item and the
-# usb3 binding had never opened a board. Both of those are now settled: the licence is
-# ratified, and the binding has run against real hardware including its failure modes.
-#
-# `false` also makes `cargo publish --dry-run` impossible, so it cannot coexist with a pipeline that
-# rehearses a publish before performing one -- and a rehearsal that cannot run is worth less than
-# the guard it protects. The control is now .github/workflows/publish-crate.yml: manual dispatch
-# only, never a push or a tag, defaulting to a dry run, with tools/check_publishable.py refusing a
-# tarball that leaks or misdeclares. That gate catches things `false` never could -- it is what
-# found a bench serial and the board vendor's name inside the shipped tests.
-#
-# Named registry rather than `true`: this crate may go to crates.io and nowhere else.
+# `tests/` IS DELIBERATELY NOT SHIPPED, for TWO reasons: `vendor_neutral.rs` exempts itself from
+# its own scan, so a tarball would carry the manufacturer's name, board model and bench serial;
+# and three suites read paths outside the crate root, so they would ship guaranteed to fail.
 publish = ["crates-io"]
 
 # Renders the feature gating: `Device::open_usb3`, `Error::Sdk` and `SdkErr` are marked with the
-# feature that supplies them instead of silently missing from a default-feature build's docs.
-# `bundled` is in the list because docs.rs builds on x86_64 Linux, which is vendored. Still NOT
-# `all-features`, so that adding a feature never silently becomes a docs-build requirement.
+# feature that supplies them instead of vanishing from a default-feature build's docs. `bundled` is
+# listed because docs.rs builds x86_64 Linux; still NOT `all-features`, which would creep.
 [package.metadata.docs.rs]
 features = ["usb3", "sim", "bundled"]
 rustdoc-args = ["--cfg", "docsrs"]
@@ -95,7 +67,7 @@ required-features = ["usb3"]
 
 [dependencies]
 # The message protocol IS JSON and the firmware emits \uXXXX escapes
-# (sw/zephyr/app/console/src/kdi_ctl.c:90-93). Hand-parsing device bytes at a trust boundary is
+# (sw/zephyr/app/console/src/kdi_ctl.c:57-63). Hand-parsing device bytes at a trust boundary is
 # the flimsier algorithm, not the lazier one.
 serde_json = "1"
 # OPTIONAL AND OFF BY DEFAULT — the containment for the release-blocker risk in
@@ -105,14 +77,9 @@ libloading = { version = "0.8", optional = true }
 [features]
 default = []
 usb3 = ["dep:libloading"]
-# Compile the target platform's USB3 driver into the artifact so a build runs on a machine with
-# no driver installed. Adds ~2 MB; OFF BY DEFAULT. A build without it loads the driver from a
-# directory. Vendored for Windows x86_64, Linux x86_64 and aarch64, and macOS aarch64 — every
-# other target is a compile error naming what is missing. Configuring a board takes the caller's
-# bitstream (`Device::open_usb3_configured`), not a second image in this crate.
-#
-# The bytes are in this crate's source EITHER WAY: Cargo packages a whole crate directory, so the
-# feature buys the artifact size back, not the download.
+# Compile the target's USB3 driver into the artifact so a build runs where no driver is
+# installed. Adds ~2 MB, OFF BY DEFAULT; vendored for Windows x86_64, Linux x86_64/aarch64 and
+# macOS aarch64, anything else a compile error. The bytes are in the source EITHER WAY.
 bundled = ["usb3"]
 # tests/conform.rs only. It spawns `python3 -m kdi.cli serve`, so it must not run in a plain
 # `cargo test` on a machine with no Python — and a MISSING python3 must fail that test rather

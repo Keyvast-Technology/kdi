@@ -1,76 +1,47 @@
-//! KDI host library — identity-first discovery, the bind handshake, acquisition as a stream of
-//! decoded records, and the typed command channel.
-//!
-//! Everything physical is quarantined in a PRIVATE `Link` enum. There is deliberately no public
-//! `trait Transport`: a trait with one useful implementation is an abstraction nobody asked for,
-//! and it would freeze a shape before a second binding exists to argue with it. The quarantine —
-//! "no endpoint number appears outside the binding module" — is the property that actually
-//! matters, and an enum gives it identically (`kdi/rs/README.md`, P6 is explicit future work).
-//!
-//! Three rules run through the whole file, each one a defect this project already shipped:
-//!
-//! * **A device error is DATA.** [`Device::raw_cmd`] returns `Ok(Reply)` for a well-framed reply with
-//!   `rc != 0`; only a host/transport failure is `Err`. The Python reference raises
-//!   `CommandError` (the Python reference host), so a caller cannot distinguish "the device said
-//!   not_present" from "the link died". The generated [`Commands`] methods are the one exception
-//!   and say why at [`Error::Device`]: they were asked for a value the refusal does not contain.
-//! * **Enumeration errors are RETURNED.** [`find`] hands back everything it could not enumerate,
-//!   because "driver present but broken" must be distinguishable from "no board"
-//!   (the Python reference host catches bare `Exception` and loses that).
-//! * **The wire is not the API.** A transport read is bytes, and a frame straddles two of them
-//!   routinely — but that is [`StreamReader`]'s problem, not a caller's. Frame alignment, CRC,
-//!   resync, reject tokens and partial-frame carry live inside this crate; [`Device::start`] hands
-//!   back [`Record`]s. The decoder is the hidden [`codec`] module and no type of its appears in
-//!   this crate's public API — it is an implementation detail, not a second product, and a host
-//!   that had to name one of its types would be back to owning the plumbing.
+//! KDI host library — identity-first discovery, the bind handshake, acquisition as decoded
+//! records, the typed command channel. Everything physical is quarantined in a PRIVATE `Link`
+//! enum: no public `trait Transport`, and no endpoint number outside a binding module.
 
 // A `pub` item with no doc comment is a support ticket. This is deny rather than warn because a
 // warning in a crate that already builds clean is a warning nobody sees.
 #![deny(missing_docs)]
-// `doc(cfg(..))` labels a feature-gated item in the rendered docs instead of letting it vanish
-// from a default-feature build. It is a NIGHTLY feature, so both the `feature` gate and every use
-// of it are behind `cfg(docsrs)` — set only by the `rustdoc-args` in Cargo.toml, never by a normal
-// build, which therefore compiles on stable exactly as before.
+// `doc(cfg(..))` labels a feature-gated item in the rendered docs instead of letting it vanish from
+// a default-feature build. NIGHTLY, so the gate and its uses sit behind `cfg(docsrs)` — set only by
+// `rustdoc-args` in Cargo.toml, never by a normal build, which still compiles on stable.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod commands;
+// The release manifest a bitstream is published with, and the judgement made against an image
+// before it is flashed. No transport, no board: it is the offline half of the bind rule.
+mod release;
 mod spec;
 mod stream;
 
 pub use commands::*;
+pub use release::*;
 pub use spec::*;
 pub(crate) use spec::{STREAM_REGS, USB3_REG};
 #[cfg(feature = "usb3")]
 pub(crate) use spec::{USB3_MSG, USB3_STREAM};
 pub use stream::*;
 
-/// The decoder, quarantined.
-///
-/// `#[doc(hidden)]`, so it is absent from the docs and from every reasonable reading of this
-/// crate's API — but NOT `pub(crate)`, deliberately: the decoder's own vector, robustness and
-/// differential harnesses are integration tests and an example, which compile against the crate
-/// from outside and therefore cannot reach a `pub(crate)` module. Making it private would mean
-/// either moving those into `src/` as unit tests, losing `KDI_FUZZ_SOAK`'s separate `--test`
-/// target, or a blanket `#![allow(dead_code)]` over the 56 items nothing else in this crate calls.
-///
-/// Nothing here is supported. `tests/layering.rs` still asserts no codec type reaches this crate's
-/// real public API, which is the property that ever mattered.
+/// The decoder, quarantined: `#[doc(hidden)]`, and NOT `pub(crate)` because its vector, robustness
+/// and differential harnesses compile from outside — private costs `KDI_FUZZ_SOAK`'s own `--test`
+/// target or `allow(dead_code)` over 56 items. `tests/layering.rs` keeps it out of the public API.
 #[doc(hidden)]
 pub mod codec;
 
-/// The USB3 device driver this crate ships, and where it came from. The provenance table is
-/// compiled in whether or not `--features bundled` is on, because Cargo packages a crate's whole
-/// source and the bytes travel with every copy of it either way. There is no gateware image here:
-/// [`Device::open_usb3_configured`] takes the bitstream the caller already has.
+/// The USB3 device driver this crate ships, and where it came from. The provenance table compiles
+/// in with or without `--features bundled`: Cargo packages the whole source, so the bytes travel
+/// either way. No gateware image here — [`Device::open_usb3_configured`] takes the caller's.
 pub mod bundled;
 
 mod udp;
 #[cfg(feature = "usb3")]
 mod usb3;
 // The Verilator harness, `--features sim`. NOT a KDI transport binding — a raw-poke wire to the
-// elaborated fabric, and the only thing that has ever checked this crate's register addresses
-// against RTL rather than against the descriptor they came from. See its module docs for what it
-// does not test (the USB3 driver FFI, the stream, the command channel).
+// elaborated fabric, and the only thing checking this crate's register addresses against RTL rather
+// than the descriptor they came from. Its module docs say what it misses (driver FFI, stream, cmd).
 #[cfg(feature = "sim")]
 mod simlink;
 
@@ -193,21 +164,15 @@ impl Filter {
     }
 }
 
-/// Discover devices by IDENTITY across every binding this build has, and report what failed.
-///
-/// The second half of the tuple is the point: a broken enumerator (an SDK that loads but does not
-/// answer, a discovery directory that cannot be read) is NOT the same observation as an empty
-/// bench, and a host that collapses the two tells a user to check their cable when the fault is on
-/// their own machine.
-///
-/// Not errors, and therefore not returned: an announced device that fails its probe (it is gone —
-/// that IS "no board"), and an announcement for a transport this build cannot open.
+/// Discover devices by IDENTITY across every binding this build has, and report what failed: a
+/// broken enumerator (an SDK that loads but does not answer, an unreadable discovery dir) is NOT
+/// an empty bench. NOT errors: a probe that fails (it IS gone), or a transport this build lacks.
 pub fn find(f: &Filter) -> (Vec<DeviceInfo>, Vec<Error>) {
     let mut found = Vec::new();
     let mut errs = Vec::new();
 
     // The software transport's enumeration analog: one JSON file per announcing device
-    // (`kdi/transport.py:67-99`).
+    // (`kdi/transport.py:24-52`).
     let dir = std::env::var_os("KDI_DISCOVERY_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("kdi-discovery"));
@@ -267,7 +232,7 @@ fn announced(path: &Path) -> Result<Option<DeviceInfo>, Error> {
         Err(e) => return Err(io_err(io::ErrorKind::InvalidData, e.to_string())),
     };
     // The announcement is a file, not a device: probe before reporting it, or a crashed server
-    // stays "found" until something unlinks its file (`kdi/transport.py:87-93`).
+    // stays "found" until something unlinks its file (`kdi/transport.py:43-47`).
     match udp::probe(addr, Duration::from_millis(300)) {
         Ok(live) => Ok(info_from(&live, addr)),
         Err(Error::Host(HostErr::HostTimeout)) => Ok(None),
@@ -316,23 +281,15 @@ impl Default for ConnectOpts {
         Self {
             need_caps: Vec::new(),
             // A DEVICE property, published so a slower boot does not turn into a fleet of hosts
-            // that each need a patch (`ready_timeout_ms`, kdi/contract.yaml:123-127).
+            // that each need a patch (`ready_timeout_ms`, kdi/contract.yaml:66-74).
             ready_timeout: Duration::from_millis(READY_TIMEOUT_MS),
         }
     }
 }
 
-/// What happened when this host asked for the device LEASE at bind.
-///
-/// `Unsupported` IS NOT A FAILURE. `sys.claim` is a `scope: session` command, and the contract's
-/// own rule for those is capability discovery BY TRYING: "a build that does not implement it
-/// answers `unknown_cmd`, and A HOST MUST TREAT `unknown_cmd` ON A SESSION COMMAND AS 'this build
-/// has no such facility' AND PROCEED" (kdi/contract.yaml:512-519). Today's firmware implements no
-/// session command and the software reference device implements all four — so a real board
-/// reporting `Unsupported` and the model reporting `Held` are both correct, and a host that
-/// treated the first as an error could never bind a board.
-///
-/// There is no `NotHeld`: `busy` is refused at bind and never becomes a state to observe here.
+/// What this host's LEASE request did at bind. `Unsupported` IS NOT A FAILURE: `sys.claim` is
+/// `scope: session`, and a build without it answers `unknown_cmd` — treat that as "no such
+/// facility" and proceed (contract.yaml:196-202). No `NotHeld`: `busy` is refused at bind.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum Lease {
@@ -344,13 +301,9 @@ pub enum Lease {
     Unsupported,
 }
 
-/// An opaque, caller-unique lease tag: `host-<pid>-<hex>`, in the spirit of the Python reference host.
-///
-/// NOT A SECRET, so deliberately not a crypto RNG and deliberately not a new dependency: the
-/// device compares it for EQUALITY against the current holder (the Python reference host), so the only
-/// property it needs is not colliding with another host's. The pid separates processes on this
-/// machine; the clock's nanoseconds mixed with the address of a stack local separate two processes
-/// that started in the same nanosecond on different machines.
+/// An opaque, caller-unique lease tag: `host-<pid>-<hex>`. NOT A SECRET — the device compares it
+/// for EQUALITY against the current holder, so it needs no crypto RNG and no new dependency, only
+/// non-collision: pid separates local processes, nanos xor a stack address separate two machines.
 fn mint_token() -> String {
     let here = 0u8;
     let nanos = std::time::SystemTime::now()
@@ -364,10 +317,9 @@ fn mint_token() -> String {
 /// DRP burst after configuration is not reliably applied on current gateware (#131).
 const RATE_APPLY_TRIES: u32 = 4;
 
-/// A bound device. Holds the link, the identity it was opened as, the capability word read at
-/// bind, the lease token minted for this session, and a shadow of every WireIn word this host has
-/// written (`Device::write_field`, private — the shadow is why an unmasked field write cannot
-/// silently disarm a neighbouring stream).
+/// A bound device: the link, the identity it was opened as, the capability word read at bind, the
+/// session's lease token, and a shadow of every WireIn word this host has written — the shadow is
+/// why an unmasked field write cannot silently disarm a neighbouring stream (`write_field`).
 pub struct Device {
     link: Link,
     info: DeviceInfo,
@@ -384,11 +336,8 @@ pub struct Device {
 
 impl Device {
     /// Open a device [`find`] reported, and BIND it: check it speaks KDI, check the contract major,
-    /// wait for `contract_ready`, read the capability word, and take the device lease.
-    ///
-    /// Errors are [`Error::Skew`] when the device is not one this host may drive (see [`Skew`] for
-    /// each reason, [`Skew::Busy`] included — another host holds the board), and [`Error::Io`] when
-    /// this build has no binding for the device's transport.
+    /// wait for `contract_ready`, read the capability word, take the lease. [`Error::Skew`] when
+    /// this host may not drive it ([`Skew::Busy`] = another host has it); [`Error::Io`] if unbound.
     pub fn open(info: &DeviceInfo, opts: &ConnectOpts) -> Result<Device, Error> {
         match (&info.addr, info.transport) {
             (Addr::Socket(a), TransportKind::Udp) => {
@@ -434,55 +383,18 @@ impl Device {
         )
     }
 
-    /// Open a board over the USB3 device driver, by serial — empty for the first one found.
-    ///
-    /// **It BINDS WHAT IS RUNNING and never flashes**, which is the whole reason it is safe to
-    /// point at a shared instrument: a host that configures the FPGA before reading its identity
-    /// has learned nothing about the device it found (the project's engineering notes, "Verify the artifact that is
-    /// actually on the bench"). [`Device::open_usb3_configured`] is the one that loads an image
-    /// the caller supplies.
-    ///
-    /// `driver_dir` is where to look for the driver, and it WINS over everything else: then
-    /// `$KDI_DRIVER_DIR` (a path list), then the copy compiled in under the `bundled` feature,
-    /// then the operating system's own search path. Pass `None` unless you are pointing a
-    /// build at a driver it was not made with.
-    ///
-    /// NOT EXERCISED BY CI — there is no driver on a CI machine and the board is remote
-    ///. Every entry point resolves by NAME at load time, so a wrong
-    /// guess is `Error::Sdk("<symbol>")` on the bench, not a link failure here. Verified by hand
-    /// against a real instrument, matching the reference host's handshake.
+    /// Open a board over the USB3 driver by serial (empty = the first found). **BINDS WHAT IS
+    /// RUNNING, never flashes** — safe on a shared board; `open_usb3_configured` loads an image.
+    /// Search order: `driver_dir`, `$KDI_DRIVER_DIR`, `bundled`, the OS. NOT EXERCISED BY CI.
     #[cfg(feature = "usb3")]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb3")))]
     pub fn open_usb3(serial: &str, driver_dir: Option<&Path>) -> Result<Device, Error> {
         Device::usb3(serial, driver_dir, None)
     }
 
-    /// Load `image` into the FPGA, then bind it.
-    ///
-    /// `image` is **the** release bitstream — `make all` / the GitHub release asset — not a second
-    /// copy this crate vendors. Configuration is **VOLATILE**: it does not touch flash and is lost
-    /// on a power cycle. It also happens to whatever board answers to `serial`, so this is a
-    /// state-changing call on a shared instrument: whatever was running is gone until someone
-    /// loads it again.
-    ///
-    /// **This is NOT what [`Device::open_usb3`] does, and the distinction is load-bearing.**
-    /// `open_usb3` binds what is already running and never flashes, because a host that configures
-    /// first has learned nothing about the device it found — an artifact gate that reconfigures
-    /// cannot tell you what was on the bench (the project's engineering notes, "Verify the artifact that is actually on
-    /// the bench"). Use this one to PUT a known image on a board; use `open_usb3` to find out what
-    /// a board is running.
-    ///
-    /// The configure's status is checked and a failure is an `Error::Sdk` naming the operation and
-    /// the status — never a silent success onto a board still running the resident bitstream. The
-    /// bind that follows then waits on the contract's own `contract_ready` register rather than
-    /// sleeping a fixed interval (`kdi/contract.yaml:115-121`), so calibration is observed rather
-    /// than assumed.
-    /// An empty or ABI-sized-too-large image is rejected before the driver is loaded or the board
-    /// is opened.
-    ///
-    /// This call does not compare [`Device::gateware_sha`] against a compiled-in constant: without
-    /// a known image the library cannot know the WireOut sha. Callers who care compare
-    /// [`Device::gateware_sha`] / [`Device::kdi`] themselves against the artifact they just sent.
+    /// Load `image` — **the** release bitstream (`make all`), not a copy this crate vendors — then
+    /// bind. VOLATILE (no flash, lost on a power cycle) and STATE-CHANGING on a shared board:
+    /// whatever ran is gone. A failed configure is an `Error::Sdk`; compare `gateware_sha` after.
     #[cfg(feature = "usb3")]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb3")))]
     pub fn open_usb3_configured(serial: &str, image: &[u8]) -> Result<Device, Error> {
@@ -500,9 +412,8 @@ impl Device {
         let info = DeviceInfo {
             serial: serial.to_string(),
             // EMPTY, NOT GUESSED. `device.vendor` / `device.compatible` are in contract.yaml but
-            // not in the generated `spec.rs`, so there is nothing to resolve them from and a
-            // literal here would be a second source of truth. Reported as a generator gap; the
-            // consequence is that a `Filter::compatible` drops usb3 boards until it is closed.
+            // not in the generated `spec.rs`, so a literal here would be a second source of truth.
+            // Reported as a generator gap; until it closes, `Filter::compatible` drops usb3 boards.
             vendor: String::new(),
             compatible: String::new(),
             board_id: None,
@@ -513,13 +424,9 @@ impl Device {
         Device::bind(link, info, &ConnectOpts::default())
     }
 
-    /// THE BIND SEQUENCE, in the one order that is correct (the Python reference host, published in
-    /// `identity_registers`): not-KDI, then major, then ready, then caps, then the LEASE.
-    ///
-    /// `contract_version == 0` MUST be refused BEFORE the major comparison. An unmapped WireOut
-    /// reads 0, so 0 is the ABSENCE of the register rather than major 0 — and while our own major
-    /// is 0 the comparison cannot tell them apart, so a non-KDI bitstream would otherwise bind
-    /// successfully and every subsequent read would be a plausible-looking zero.
+    /// THE BIND SEQUENCE, in the one correct order (the Python reference host's
+    /// `identity_registers`): not-KDI, major, ready, caps, LEASE. A `contract_version` of 0 is cut
+    /// BEFORE the major compare — an unmapped WireOut reads 0, so a non-KDI board would bind clean.
     fn bind(link: Link, info: DeviceInfo, opts: &ConnectOpts) -> Result<Device, Error> {
         let mut d = Device {
             link,
@@ -540,7 +447,7 @@ impl Device {
         }
         let (major, minor) = ((cv >> 16) as u16, cv as u16);
         // Major equality and NOTHING ELSE. A device minor higher than the host's is always fine —
-        // a minor is additive by definition (kdi/contract.yaml:111-112).
+        // a minor is additive by definition (kdi/contract.yaml:63-63).
         if major != KDI_MAJOR {
             return Err(Error::Skew(Skew::Major {
                 device: major,
@@ -563,7 +470,7 @@ impl Device {
         d.gateware_sha = d.read_reg("gateware_sha")?;
         // LAST, and only when the device advertises a command channel. Without that capability
         // there is nothing to claim; with it, every non-RO command is refused `not_claimed` until
-        // the request carries the holder's token (`kdi/device.py:306-307`).
+        // the request carries the holder's token (`kdi/device.py:214-214`).
         d.lease = if d.caps.has(Cap::CommandProtocol) {
             d.claim()?
         } else {
@@ -572,24 +479,13 @@ impl Device {
         Ok(d)
     }
 
-    /// Take the device lease, if this build has one (the Python reference host).
-    ///
-    /// Three answers, and only one of them refuses:
-    ///
-    /// * `rc == 0` — held.
-    /// * `unknown_cmd` — this build implements no session command, which is not an error; see
-    ///   [`Lease`].
-    /// * anything else, `busy` first among them — REFUSE THE BIND. The board is a single-holder
-    ///   resource, and a second host that proceeded anyway would write the same WireIn words from
-    ///   its own zero-initialised shadow ([`Device::write_field`]): the damage presents downstream
-    ///   as a gateware regression, not as two hosts (kdi/contract.yaml:531-534).
-    ///
-    /// A binding with no message channel at all (`Link::has_message` is false — the Verilator
-    /// harness, which runs no firmware) reports [`Lease::Unsupported`] without sending. That is
-    /// the `supports("message")` gate in the reference (the Python reference host). A transport
-    /// failure on a binding that DOES have a message channel is a bind failure: a dead vUART is
-    /// not "this build has no lease".
+    /// Take the device lease, if this build has one. `rc == 0` held; `unknown_cmd` = no session
+    /// command, not an error (see [`Lease`]); anything else, `busy` first, REFUSES THE BIND — a
+    /// second host writes the same WireIns from a zero shadow and looks like a gateware regression.
     fn claim(&mut self) -> Result<Lease, Error> {
+        // No message channel at all (the Verilator harness runs no firmware) is Unsupported, not a
+        // failure. A transport error on a binding that HAS one is a bind failure — a dead vUART is
+        // not "this build has no lease".
         if !self.link.has_message() {
             return Ok(Lease::Unsupported);
         }
@@ -633,9 +529,8 @@ impl Device {
     }
 
     /// Poll `contract_ready`. The `init_calib` scar made explicit: acquiring before calibration
-    /// silently drops beats, worst at one lane, and there is no other way to observe it
-    /// (kdi/contract.yaml:115-121; `tools/rhd_term.py:123-136` is the blind 2 s sleep this
-    /// replaces).
+    /// silently drops beats, worst at one lane, and nothing else sees it (contract.yaml:63-63;
+    /// `tools/rhd_term.py:82-114` is the blind 2 s sleep this replaces).
     pub fn wait_ready(&mut self, timeout: Duration) -> Result<(), Error> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -649,21 +544,9 @@ impl Device {
         }
     }
 
-    /// Send a command by NAME, arguments POSITIONAL in the order the contract declares them
-    /// (`request.arg_order: declared`, kdi/contract.yaml:770).
-    ///
-    /// The escape hatch, and it is load-bearing rather than a convenience: a device on a NEWER
-    /// MINOR legitimately has commands this build's generated methods do not know, and the
-    /// contract's rule is that a higher minor binds normally. Prefer the typed methods in
-    /// [`Commands`] — they check every declared range before a byte is sent.
-    ///
-    /// Every token — id, name and each argument — must match `ARG_CHARSET` or this returns
-    /// `Err(Host(HostUnsafeArg))` WITHOUT SENDING A BYTE. This wire is shared with an ungated
-    /// human shell: a value containing CR appends an arbitrary `kv` command (which can write
-    /// EEPROMs) and one containing the response sentinel forges a reply
-    /// (`arg_charset_rule`, kdi/contract.yaml:772-778).
-    ///
-    /// A well-framed reply with `rc != 0` is `Ok(Reply)` — a device error is DATA.
+    /// Send a command by NAME, args POSITIONAL in declared order (contract.yaml:263). `rc != 0` is
+    /// `Ok(Reply)` — a device error is DATA. An escape hatch for a newer minor; prefer the typed
+    /// [`Commands`]. A token off `ARG_CHARSET` is `HostUnsafeArg`, unsent: a CR appends a `kv` cmd.
     pub fn raw_cmd(&mut self, name: &str, args: &[&str]) -> Result<Reply, Error> {
         self.next_id = self.next_id.wrapping_add(1);
         let id = format!("{:x}", self.next_id);
@@ -672,32 +555,22 @@ impl Device {
         }
         debug_assert!(safe_token(&id));
         // The lease token rides on EVERY request, claim included, exactly as the reference does
-        // (`kdi/client.py:169`). It is an envelope key and never an argument, so it is not subject
+        // (`kdi/client.py:142`). It is an envelope key and never an argument, so it is not subject
         // to the charset gate above — but `mint_token` emits `[A-Za-z0-9-]` anyway.
         self.link.message(&id, name, args, &self.token)
     }
 
     /// Release the lease and drop the link. Takes `self`, so a closed device cannot be used again.
-    ///
-    /// Always `Ok` today: the release is BEST EFFORT and its failure is deliberately not reported.
-    /// A device that stopped answering is already gone, and holding a lease open on it is not
-    /// something this host can fix — reporting it would turn every crashed link into two errors.
-    /// Dropping a `Device` without calling this closes the transport just the same; what it skips
-    /// is the release, so the board stays claimed until its lease expires.
+    /// Always `Ok`: the release is best effort. Dropping a `Device` instead closes the transport
+    /// just the same but skips the release, so the board stays claimed until its lease expires.
     pub fn close(mut self) -> Result<(), Error> {
-        // QUIESCE FIRST. The instrument is single-owner and its acquisition state outlives the
-        // process that set it, so a host that just exits hands the next one a running engine and
-        // full pipes. Measured: a host opening after that received one record per twenty sample
-        // periods with the sticky overrun CLEAR -- valid frames, monotonic stamps, 95 % of the data
-        // gone, and nothing in the published surface able to see it. Leaving it running is not a
-        // neutral act, so closing cleans up whether or not the caller remembered to.
-        //
-        // Best effort, like the release below: a device that has stopped answering is already gone.
+        // QUIESCE FIRST: acquisition state outlives the process, so a host that just exits hands
+        // the next one a running engine and full pipes. Measured: one record per twenty sample
+        // periods, sticky overrun CLEAR — valid frames, 95 % of the data gone, nothing reports it.
         let _ = self.quiesce();
-        // BEST EFFORT, and its failure may not mask a close error (`kdi/client.py:335-340` puts
-        // the release in the `try` and the transport teardown in the `finally`). A device that
-        // stopped answering is already gone; holding the lease open on it is not a thing this
-        // host can fix, and reporting it would turn every crashed link into two errors.
+        // BEST EFFORT, and its failure may not mask a close error (`kdi/client.py:186-190`: release
+        // in the `try`, transport teardown in the `finally`). A device that stopped answering is
+        // gone; reporting the stuck lease would turn every crashed link into two errors.
         if self.lease == Lease::Held {
             let _ = self.raw_cmd("sys.release", &[]);
         }
@@ -707,43 +580,29 @@ impl Device {
         Ok(())
     }
 
-    /// Return acquisition to a defined state: flush both streams, disarm any other consumer, stop
-    /// the engine.
-    ///
-    /// Call it on the way IN if you may have inherited a dirty instrument, and know that
-    /// [`Device::close`] already calls it on the way out. Without it a host has no way to escape
-    /// what a previous application left behind, and no way to detect that it has not: the symptom
-    /// is well-formed frames arriving far too slowly, with the sticky overrun clear.
-    ///
-    /// **It returns the device to UNCONFIGURED** (contract 0.5): the rate register reverts to the
-    /// default and `rate_ready` clears with it, so `rhd_matrix` emits nothing until
-    /// [`Device::set_rate`] is called again. The pulse is masked, so it does not disturb the
-    /// register's other fields.
+    /// Flush both streams, disarm any other consumer, stop the engine — on the way IN if you may
+    /// have inherited a dirty instrument, and [`Device::close`] does it on the way out. Otherwise
+    /// the symptom is valid frames far too slowly, overrun clear. **Leaves it UNCONFIGURED (0.5).**
     pub fn quiesce(&mut self) -> Result<(), Error> {
+        // CLEAR THE RUN BITS FIRST: they are host-written WireIn state, so the device-side reset
+        // below cannot touch them, and a host that died mid-stream leaves it running for the next.
+        // Measured: a samples-only host then gets one record per twenty periods, overrun clear.
+        for s in [Stream::Samples, Stream::Digital] {
+            let _ = self.write_field(crate::stream::run_reg(s), 0);
+        }
         self.write_field("quiesce", 1)?;
         self.write_field("quiesce", 0)
     }
 
-    /// Is the acquisition rate configured, so `rhd_matrix` may emit?
-    ///
-    /// False from power-up on a device that advertises [`Cap::RateControl`]. See [`set_rate`].
-    ///
-    /// [`set_rate`]: Device::set_rate
+    /// Is the acquisition rate configured, so `rhd_matrix` may emit? False from power-up on a
+    /// device that advertises [`Cap::RateControl`]. See [`Device::set_rate`].
     pub fn rate_ready(&mut self) -> Result<bool, Error> {
         Ok(self.read_reg("rate_ready")? & 1 != 0)
     }
 
-    /// Configure the acquisition rate, and VERIFY it took.
-    ///
-    /// `m`/`d` are the MMCM feedback pair the device's rate table is keyed on. Passing `0, 0`
-    /// selects the device default, which is a legitimate choice: what matters is not WHICH rate is
-    /// chosen but that one was applied. Until it is, the device emits one frame per twenty sample
-    /// periods while its header declares the full cadence (#131) — measured, and unrelated to
-    /// transport, which loses nothing.
-    ///
-    /// This POLLS `rate_ready` and re-applies rather than assuming the write took.
-    ///
-    /// Returns `Io(TimedOut)` if the device never reports ready.
+    /// Configure the acquisition rate and VERIFY it took: POLLS `rate_ready` and re-applies, else
+    /// `Io(TimedOut)`. `m`/`d` are the MMCM pair the device's rate table is keyed on; `0, 0` picks
+    /// its default. Unconfigured it emits 1 frame per 20 periods, declaring full cadence (#131).
     pub fn set_rate(&mut self, m: u8, d: u8) -> Result<(), Error> {
         if !self.caps().has(Cap::RateControl) {
             // Older gateware has no gate and no readback: the rate is whatever it is, and saying so
@@ -783,15 +642,9 @@ impl Device {
         self.link.reg_read(name, r)
     }
 
-    /// EVERY WireIn field write is masked into this host's shadow of the WHOLE WORD, then the word
-    /// is written (`masked_field_write`, kdi/contract.yaml:407-408). Registers share words: both
-    /// run bits are on WireIn 0x11 and both burst bounds on 0x13, because KDI owns only three
-    /// WireIns. An unmasked write to one field clears its neighbour, which SILENTLY DISARMS THE
-    /// OTHER STREAM.
-    ///
-    /// The shadow starts at zero, which is the post-configure state of every WireIn. WireIns are
-    /// write-only, so a host attaching to an already-running board cannot read one back and must
-    /// re-establish every field it intends to own.
+    /// EVERY WireIn field write is masked into this host's shadow of the WHOLE WORD (contract.yaml:
+    /// 407-408). Both run bits share WireIn 0x11 and both burst bounds 0x13, so an unmasked write
+    /// SILENTLY DISARMS THE OTHER STREAM. Write-only: the shadow starts at 0, as WireIns do.
     fn write_field(&mut self, name: &str, value: u32) -> Result<(), Error> {
         let r = reg(name)?;
         if r.kind == "wireout" {
@@ -901,7 +754,7 @@ impl Link {
     fn reg_read(&mut self, name: &str, r: RegBind) -> Result<u32, Error> {
         match self {
             // The UDP binding is a NAME map: the device resolves the field itself, so the host
-            // must not shift what it gets back (`bindings.udp.note`, kdi/contract.yaml:663).
+            // must not shift what it gets back (`bindings.udp.note`, kdi/contract.yaml:196).
             Link::Udp(u) => u.reg_read(name),
             #[cfg(feature = "usb3")]
             Link::Usb3(u) => u.reg_read(r),
@@ -967,11 +820,9 @@ impl Link {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Caps(pub u32);
 
-/// Every capability bit, in bit order.
-///
-/// HAND-WRITTEN, because the generated `spec.rs` publishes no `ALL` array and no `Cap::from_bit`
-/// (reported as a generator gap). `caps_list_is_complete` below is an exhaustive match, so adding
-/// a capability to the contract stops this crate compiling until a human extends the list.
+/// Every capability bit, in bit order. HAND-WRITTEN: the generated `spec.rs` publishes no `ALL`
+/// array and no `Cap::from_bit` (a reported generator gap). `caps_list_is_complete` below is an
+/// exhaustive match, so a new contract capability stops this crate compiling until a human acts.
 const ALL_CAPS: [Cap; 9] = [
     Cap::CleanFrame,
     Cap::CommandProtocol,
@@ -1007,7 +858,7 @@ pub struct Reply {
     /// reply from a timed-out command can never arrive here as this command's answer.
     pub id: String,
     /// A platform errno, INFORMATIVE ONLY — the same "unknown command" is -38 on Linux and -88 on
-    /// this target, which is exactly why `err` is the contract (kdi/contract.yaml:59-62).
+    /// this target, which is exactly why `err` is the contract (kdi/contract.yaml:23-23).
     pub rc: i32,
     /// `None` on success — and also for a token this build does not know, which is legal from a
     /// device on a newer minor and must never be a parse failure. `ok()` still reports false,
@@ -1063,12 +914,9 @@ fn reply_from(v: Value) -> Result<Reply, Error> {
 }
 
 impl DeviceErr {
-    /// Is retrying this command capable of a different answer?
-    ///
-    /// HAND-WRITTEN and exhaustive, mirroring `errors.*.retryable` in the contract. No wildcard
-    /// arm, ever: a token added to `contract.yaml` must stop this compiling until a human decides,
-    /// because the wrong default is the dangerous one — a retry loop on `not_present` drives pins
-    /// on a slot that is not there.
+    /// Is retrying this command capable of a different answer? HAND-WRITTEN and exhaustive,
+    /// mirroring `errors.*.retryable`. No wildcard arm, ever: a new token must stop this compiling,
+    /// because the wrong default is dangerous — a retry loop on `not_present` drives absent pins.
     pub fn retryable(self) -> bool {
         match self {
             DeviceErr::NoDevice => true, // a Zephyr device is not ready yet
@@ -1091,18 +939,15 @@ impl DeviceErr {
 
 // ─────────────────────────────────────────────────────────────────────────── errors
 
-/// THERE IS NO DECODE VARIANT, deliberately. A rejected frame is not an error a caller can act on
-/// in the middle of a recording — it is a fact about the link's quality, and killing hours of
-/// acquisition over one flipped bit is the behaviour the Python reference's `walk()` had
-/// (the Python reference host). [`StreamReader`] resyncs past it and counts it in [`Stats::bad_frames`];
-/// every `Error` below means the transport, the host or the device failed, never the bytes.
+/// THERE IS NO DECODE VARIANT, deliberately: a rejected frame is a fact about link quality, not
+/// something a caller can act on mid-recording (the Python `walk()` killed the run over one flipped
+/// bit). [`StreamReader`] resyncs and counts it; every `Error` here is transport, host or device.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// The device answered and REFUSED. Only the generated [`Commands`] methods mint this:
-    /// [`Device::raw_cmd`] still returns `rc != 0` as data, because its caller holds the `Reply` and
-    /// is obliged to read it — but a typed method asked for a value, and a refusal contains none,
-    /// so the alternative is a struct of zeros parsed out of absent keys.
+    /// [`Device::raw_cmd`] returns `rc != 0` as data because its caller holds the `Reply`, but a
+    /// typed method asked for a value and a refusal has none — else a struct of zeros from no keys.
     Device(Reply),
     /// THIS HOST refused, and nothing went to the wire — an argument outside the contract's
     /// charset, a deadline that expired, a transport that returned less than its framing declared.
@@ -1141,10 +986,9 @@ pub enum Skew {
     /// The device lacks capabilities [`ConnectOpts::need_caps`] asked for. Carries exactly the
     /// missing ones.
     MissingCaps(Vec<Cap>),
-    /// `sys.claim` was refused — another host holds the board. A SKEW, not a device error,
-    /// because it is a reason the traffic that would follow cannot be trusted: the second host's
-    /// WireIn shadow starts at zero and knows nothing of the fields the holder owns. Carries the
-    /// reply so a log keeps the token the device actually sent.
+    /// `sys.claim` was refused — another host holds the board. A SKEW, not a device error: the
+    /// second host's WireIn shadow starts at zero and knows nothing of the fields the holder owns.
+    /// Carries the reply, so a log keeps the token the device actually sent.
     Busy(Reply),
 }
 
@@ -1152,7 +996,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             // `err` before `rc`: the token IS the contract, the errno is a platform accident
-            // (kdi/contract.yaml:59-62). An unknown token prints as `?` rather than being dropped
+            // (kdi/contract.yaml:23-23). An unknown token prints as `?` rather than being dropped
             // — it means a device on a newer minor, not a malformed reply.
             Error::Device(r) => write!(
                 f,
@@ -1204,12 +1048,8 @@ fn io_err(kind: io::ErrorKind, msg: impl Into<String>) -> Error {
 }
 
 /// A blocking-socket deadline is `WouldBlock` on Linux and `TimedOut` on Windows — both mean the
-/// peer stopped answering, and the closed host set has ONE token for that (`host_timeout`,
-/// `contract.yaml:90-94`), never a minted one.
-///
-/// One definition, because it was two: `udp.rs` and `simlink.rs` each owned the rule and each
-/// carried its own copy of the platform note. Two transports agreeing by coincidence is how they
-/// stop agreeing — a third would have made it three.
+/// peer stopped answering, and the closed host set has ONE token for it (`host_timeout`,
+/// contract.yaml:48-48). One definition: `udp.rs` and `simlink.rs` each carried their own copy.
 pub(crate) fn io_or_timeout(e: io::Error) -> Error {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Host(HostErr::HostTimeout),
@@ -1226,10 +1066,8 @@ fn safe_token(t: &str) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────── checks
-//
-// The three things in this crate that are logic rather than plumbing, and none of them needs a
-// device: the field masking (whose failure is silent), the charset (whose failure is command
-// injection), and the completeness of the capability list.
+// The three things in this crate that are logic rather than plumbing, and need no device: the field
+// masking (silent failure), the charset (command injection), and the capability list itself.
 
 #[cfg(test)]
 mod tests {
@@ -1310,9 +1148,8 @@ mod tests {
             assert_eq!(reg(burst).unwrap().kind, "wirein");
             assert_eq!(reg(status).unwrap().kind, "wireout");
             // `lanes` is optional in the contract and only `samples` declares one. Asserting the
-            // ABSENCE matters as much as the presence: `Acquisition::lanes` is silently ignored for
-            // a stream with no mask, and a table that grew a bogus `lanes_digital` would turn that
-            // into a write to a register the device does not decode.
+            // ABSENCE matters too: `Acquisition::lanes` is silently ignored for a stream with no
+            // mask, and a bogus `lanes_digital` would write a register the device does not decode.
             assert_eq!(lanes.is_some(), s == Stream::Samples);
             if let Some(lanes) = lanes {
                 assert_eq!(reg(lanes).unwrap().kind, "wirein");

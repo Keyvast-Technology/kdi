@@ -1,33 +1,6 @@
-//! The SIM harness binding: the SHIPPING SpinalHDL fabric under Verilator, poked over TCP.
-//!
-//! **This is not a KDI transport binding and must never be described as one.** The contract
-//! publishes `bindings.udp` and `bindings.usb3`; a `tcp` binding does not exist and is not being
-//! implemented here (`kdi/rs/README.md`, the "not built" table). What is on this socket is
-//! `hw/spinal/src/test/scala/kdi/KdiSimServer.scala`'s DUMB ADDRESS-LEVEL POKE protocol — the same
-//! wire the Python reference host drives — with every KDI concept left on this side:
-//!
-//! ```text
-//! {"op":"wireout_read","addr":N}                    -> {"value":N}
-//! {"op":"wirein_write","addr":N,"value":N,"mask":N} -> {"ok":true}
-//! {"op":"trigger","addr":N,"bit":N}                 -> {"ok":true}
-//! ```
-//!
-//! WHY IT EXISTS: the usb3 binding resolves every register through the generated `USB3_REG` table
-//! and **has never opened a board** (`kdi/rs/README.md`, "hardware verification of `usb3`"). Nothing
-//! had ever checked that those addresses name WireOuts the fabric actually drives — the Python host
-//! has that check (`tools/kdi_conform_sim.py`), the Rust one had none. This gives it one, against
-//! real elaborated RTL, with no bench.
-//!
-//! WHAT IT DOES NOT TEST, stated plainly:
-//!
-//! * **Not the driver FFI.** `usb3.rs`'s `dlopen`, its symbol resolution and its C calls are
-//!   not on this path at all. A board is still the only thing that
-//!   exercises them.
-//! * **Not the sample stream, not the command channel.** The harness stubs the DDR3 app bus and
-//!   runs no firmware (`KdiSimServer.scala:33-36`), so [`Sim::stream_read`] and [`Sim::message`]
-//!   REFUSE rather than return plausible emptiness — a host that reads "no records" from a device
-//!   that cannot produce any has learnt nothing, and this repo has been bitten by pass-by-skip
-//!   often enough to make the refusal explicit.
+//! The SIM harness binding: the SHIPPING SpinalHDL fabric under Verilator, poked over TCP. NOT a
+//! KDI transport binding — `KdiSimServer.scala`'s dumb address-level pokes — but the only thing
+//! that checks `USB3_REG`'s addresses against real RTL. Not the driver FFI, the stream or commands.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -43,30 +16,17 @@ use std::io;
 
 /// One RPC deadline, generous on purpose: Verilator advances the whole fabric one clock per
 /// service loop, so a poke that would be microseconds on USB3 is milliseconds here and a tight
-/// timeout buys nothing but a flaky failure (the Python reference host uses 30 s for the same reason).
+/// timeout buys nothing but a flaky failure (the Python host uses 30 s too).
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The fabric's own per-slot SPI-running word — **NOT a KDI register**, and the only reason a
-/// literal endpoint appears in this crate outside the generated table.
-///
-/// It is here because it is the ONLY witness this DUT offers that a WireIn write arrived: the
-/// harness is `rhd.RhdAssembly`, whose sole WireIn-sensitive path is `run_samples` ->
-/// `kdi_engine_req` -> the SPI engine -> `slot_running` (`hw/spinal/src/test/scala/rhd/RhdAssembly.scala:90`,
-/// `hw/spinal/src/main/scala/rhd/RhdAggregator.scala:534`). Without it a WireIn write is
-/// unobservable and the address half of the binding stays unproven in the write direction — which
-/// is exactly the gap this module was built to close. It lives in the binding module because that
-/// is where this crate keeps endpoint numbers (see the `lib.rs` module docs).
+/// literal endpoint appears outside the generated table: it is the ONLY witness this DUT offers
+/// that a WireIn write arrived (`rhd/RhdAssembly.scala:56`, `rhd/RhdAggregator.scala:262`).
 const WO_SLOT_RUNNING: u8 = 0x34;
 
-/// The legacy RHX host-reset word (WireIn 0x00, bit 0) — **NOT a KDI register** either, and the
-/// second and last literal endpoint here.
-///
-/// It is the only thing that STOPS the SPI engine: the cores latch `continuous` from
-/// `kdi_engine_req` at the config fan-out and never re-read it
-/// (`hw/spinal/src/main/scala/rhd/RhdAggregator.scala:219`), so once the engine is up, clearing
-/// `run_samples` changes nothing observable. After a reset the fabric re-requests the start IFF
-/// `run_samples` is still asserted (`:195`, the documented "free retry") — which is what turns the
-/// survival of a field across a NEIGHBOURING field's write into something real RTL can witness.
+/// The legacy RHX host-reset word (WireIn 0x00, bit 0) — **NOT a KDI register**. The only thing
+/// that STOPS the SPI engine: the cores latch `continuous` once (`rhd/RhdAggregator.scala:86`)
+/// and re-request on reset iff `run_samples` (:195).
 const WI_HOST_RESET: u8 = 0x00;
 
 pub(crate) struct Sim {
@@ -86,7 +46,7 @@ impl Sim {
         Ok(Sim { sock })
     }
 
-    /// 4-byte big-endian length + payload, both ways (`KdiSimServer.scala:30`, and
+    /// 4-byte big-endian length + payload, both ways (`KdiSimServer.scala:23`, and
     /// the Python reference host's TcpTransport before it).
     fn rpc(&mut self, req: &Value) -> Result<Vec<u8>, Error> {
         let body = serde_json::to_vec(req)
@@ -130,10 +90,9 @@ impl Sim {
         Ok(v)
     }
 
-    /// Identity, tier-A: what is knowable without asking the gateware. The serial matches
-    /// the Python reference host so one harness has one name in both hosts' logs. `vendor`/`compatible`
-    /// stay EMPTY for the same reason `usb3::identity` leaves them empty — they are not in the
-    /// generated spec, and a literal here would be a second source of truth.
+    /// Identity, tier-A: knowable without asking the gateware. The serial matches the Python
+    /// reference so one harness has one name in both logs; `vendor`/`compatible` stay EMPTY —
+    /// they are not in the generated spec, and a literal would be a second source of truth.
     pub(crate) fn identity(&self) -> Value {
         json!({"serial": "KDISIM01", "transport": "sim"})
     }
@@ -164,10 +123,9 @@ impl Sim {
             })
     }
 
-    /// `word` is the CALLER's shadow of the WHOLE WireIn, already masked by `Device::write_field`.
-    /// The mask sent here is therefore wide, byte-for-byte what `usb3::reg_write` hands
-    /// the driver's wire-in write: the host owns the read-modify-write, and that is the
-    /// `masked_field_write` invariant this harness lets a test observe against real RTL.
+    /// `word` is the CALLER's shadow of the WHOLE WireIn, already masked by `Device::write_field`,
+    /// so the mask sent here is wide — byte-for-byte what `usb3::reg_write` does. The host owns the
+    /// read-modify-write, which is the `masked_field_write` invariant this harness can witness.
     pub(crate) fn reg_write(&mut self, r: RegBind, word: u32) -> Result<(), Error> {
         match r.kind {
             "wirein" => {
@@ -188,9 +146,8 @@ impl Sim {
     }
 
     /// REFUSED, not empty. The harness stubs the DDR3 app bus, so there are no frames to read
-    /// (`KdiSimServer.scala:145-148` answers every pipe read with zero bytes). Returning `Ok(0)`
-    /// would make a caller's "no records in 10 s" indistinguishable from a device that is simply
-    /// not producing any — the pass-by-skip shape the project's engineering notes names.
+    /// (`KdiSimServer.scala:58-58` answers every pipe read with zero bytes). `Ok(0)` would be
+    /// indistinguishable from a device that produces none — the pass-by-skip shape.
     pub(crate) fn stream_read(&mut self, s: Stream, _buf: &mut [u8]) -> Result<usize, Error> {
         Err(io_err(
             io::ErrorKind::Unsupported,
@@ -204,8 +161,7 @@ impl Sim {
 
     /// REFUSED for the same reason: the message channel is the vUART into FIRMWARE, and this
     /// harness runs no CPU. `Link::has_message` is false here, so [`crate::Device::claim`] reports
-    /// [`crate::Lease::Unsupported`] without sending — a dead vUART is not "this build has no
-    /// lease", but a binding with no firmware is.
+    /// [`crate::Lease::Unsupported`] without sending — a binding with no firmware has no lease.
     pub(crate) fn message(
         &mut self,
         _id: &str,
@@ -222,13 +178,8 @@ impl Sim {
 
 impl Device {
     /// Bind the elaborated gateware served by `make kdi-sim` (Verilator) over its poke protocol.
-    ///
-    /// The address is the harness's, not a device's: there is no discovery here, because a
-    /// simulator does not announce itself. Everything after the socket is the ORDINARY bind —
-    /// `contract_version`, the major check, `contract_ready`, `caps`, `gateware_sha` — resolved
-    /// through the generated `USB3_REG` table, which is the point of the exercise.
-    ///
-    /// Behind `--features sim`, and it changes nothing about a default build.
+    /// No discovery: a simulator does not announce itself. Everything after the socket is the
+    /// ORDINARY bind, resolved through the generated `USB3_REG` table, which is the point.
     #[cfg_attr(docsrs, doc(cfg(feature = "sim")))]
     pub fn connect_sim(addr: SocketAddr, timeout: Duration) -> Result<Device, Error> {
         let link = Sim::connect(addr, timeout)?;
@@ -251,10 +202,9 @@ impl Device {
         )
     }
 
-    /// Is the fabric's SPI engine running? The one WireIn effect this DUT can be asked about —
-    /// see [`WO_SLOT_RUNNING`] for why it is a raw endpoint and what it witnesses.
-    ///
-    /// SIM ONLY. `slot_running` is not a KDI register and no board-facing code may read it.
+    /// Is the fabric's SPI engine running? The one WireIn effect this DUT can be asked about — see
+    /// [`WO_SLOT_RUNNING`] for what it witnesses. SIM ONLY: `slot_running` is not a KDI register
+    /// and no board-facing code may read it.
     #[cfg_attr(docsrs, doc(cfg(feature = "sim")))]
     pub fn sim_engine_running(&mut self) -> Result<bool, Error> {
         match &mut self.link {
@@ -267,9 +217,7 @@ impl Device {
     }
 
     /// Pulse the fabric's host reset, stopping the SPI engine — see [`WI_HOST_RESET`] for why a
-    /// test needs it and why it is a raw endpoint.
-    ///
-    /// SIM ONLY, and it would be actively dangerous on a board: it is the legacy RHX reset, it
+    /// test needs it. SIM ONLY, and actively dangerous on a board: it is the legacy RHX reset, it
     /// belongs to no KDI register, and this host's WireIn shadow does not model it.
     #[cfg_attr(docsrs, doc(cfg(feature = "sim")))]
     pub fn sim_host_reset(&mut self) -> Result<(), Error> {

@@ -1,30 +1,10 @@
-//! KDI format 2 — the self-describing frame container, decoded.
-//!
-//! The frame carries its own geometry, so **nothing here takes a descriptor**: every length, lane
-//! identity, element width and cadence is on the wire (`kdi/contract.yaml:228-249`,
-//! `streams.samples.wire_layout`). A decoder needs the bytes and nothing else, which is why this
-//! module stays `core`-only, allocation-free and dependency-free.
-//!
-//! Two things are deliberately NOT in the frame and therefore not in [`Frame`]:
-//!
-//! * the one cross-frame rule ([`check_run_announcements`]), kept out of [`Walk`] so a decoder's
-//!   verdict cannot depend on the caller's chunk size — see that function's note;
-//! * anything that interprets a `kind`'s payload. Row order, encoding and the volts-per-code scale
-//!   are contract semantics (`kdi/contract.yaml:317-354`), not container semantics.
-//!
-//! Every rejection carries the contract's exact token (`Reject`, generated from
-//! `reject_tokens`), because a third-party decoder reproducing them is the only thing the
-//! published negative vectors can actually check.
+//! KDI format 2 — the self-describing frame container, decoded. Every length, lane identity,
+//! element width and cadence is ON THE WIRE (contract.yaml:165-183), so nothing here takes a
+//! descriptor; it interprets no payload — row order, encoding, scale are semantics (:317-354).
 
-// INNER attributes, so they cover this module and every descendant of it, and an inner `allow`
-// cannot undo the `forbid`. This module was its own crate until the merge, and these two are the
-// part of that boundary the compiler still enforces after it.
-//
-// `#![no_std]` did NOT survive — it is a crate attribute with no module form. What replaces it is
-// `tests/codec_isolation.rs`, which asserts this module names nothing outside `core` and its own
-// tree. That is a weaker guard than a manifest and it is written down as weaker: a re-export or a
-// macro can hide a `std` path from it. Do not add `use std::` here on the grounds that the test is
-// quiet.
+// INNER attributes, so they cover every descendant and an inner `allow` cannot undo the `forbid`.
+// `#![no_std]` did NOT survive the merge — it has no module form. `tests/codec_isolation.rs`
+// replaces it and is WEAKER (a re-export can hide a `std` path): do not add `use std::` here.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -36,7 +16,7 @@ pub use spec::*;
 const _: () = assert!(version_matches(env!("CARGO_PKG_VERSION"), KDI_VERSION));
 
 /// `pkg` must be `<KDI_VERSION>.<patch>` — the crate version tracks the CONTRACT version, not the
-/// repo's release tag (`kdi/rs/Cargo.toml:15-20`), so the major.minor is not free to drift and the
+/// repo's release tag (`kdi/rs/Cargo.toml:4-4`), so the major.minor is not free to drift and the
 /// patch is the only component this crate may pick.
 const fn version_matches(pkg: &str, kdi: &str) -> bool {
     let (p, k) = (pkg.as_bytes(), kdi.as_bytes());
@@ -75,10 +55,8 @@ impl RejectAt {
 }
 
 /// A singular accessor met a frame that legally carries more than one section of that kind.
-/// NOT a `Reject`: the frame is valid (`dup_kinds_ok`, `kdi/contract.yaml:394`) and this is
-/// host-API misuse — `ambiguous_kind` lives in `host_reject_tokens` for exactly that reason
-/// (`kdi/contract.yaml:438-443`), so it is not in the generated `Reject` enum and must not be
-/// counted against a device.
+/// NOT a `Reject`: the frame is valid (`dup_kinds_ok`, contract.yaml:97) and this is host-API
+/// misuse — `ambiguous_kind` is in `host_reject_tokens` (:438-443), never counted against a device.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Ambiguous {
     /// The `kind` code that was asked for.
@@ -96,18 +74,9 @@ impl Ambiguous {
 }
 
 impl Reject {
-    /// Is the frame's declared LENGTH still trustworthy after this rejection?
-    ///
-    /// THE DRIFT MECHANISM: one hand-written exhaustive match, carrying a judgement the contract
-    /// cannot express. Add a token to `contract.yaml` and this stops compiling until a human
-    /// classifies it — which is why there is no wildcard arm and must never be one.
-    ///
-    /// The judgement: every check except these two runs AFTER the CRC has passed, so `frame_words`
-    /// is verified and a decoder must step over the frame by its own length. If it resynced
-    /// instead it would rescan the frame's body for a byte pattern that means nothing there, and
-    /// any `4b 56 44 46` inside a sample would mint a phantom frame. `crc_err` and `bad_length`
-    /// are the two where the length itself is unverified, so scanning for the next magic is the
-    /// only way forward (`magic_is_anchor`, `kdi/contract.yaml:368`).
+    /// Is the declared LENGTH still trustworthy after this rejection? THE DRIFT MECHANISM: one
+    /// hand-written exhaustive match, no wildcard arm ever. Only `crc_err`/`bad_length` leave it
+    /// unverified; past a CRC, a rescan mints a phantom frame from any `4b 56 44 46` in a sample.
     pub fn resyncable(self) -> bool {
         match self {
             Reject::CrcErr => true,
@@ -128,13 +97,13 @@ impl Reject {
 // ─────────────────────────────────────────────────────────────────────── header
 
 /// Header flags. Reserved bits are rejected rather than masked off (`reserved_reject`,
-/// `kdi/contract.yaml:380`), so a `Flags` that exists has only defined bits set.
+/// `kdi/contract.yaml:97`), so a `Flags` that exists has only defined bits set.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Flags(pub u16);
 
 impl Flags {
     /// The start of a contiguous segment of THIS stream. Its timestamp need not be 0 and there may
-    /// be several per `run_id` — `run_id` is the device-wide epoch (`kdi/contract.yaml:391-392`).
+    /// be several per `run_id` — `run_id` is the device-wide epoch (`kdi/contract.yaml:97-97`).
     pub const fn first_of_run(self) -> bool {
         self.0 & FLAG_FIRST_OF_RUN != 0
     }
@@ -152,16 +121,13 @@ impl Flags {
 }
 
 /// A frame's fixed header, decoded. Every field is verified by [`Frame::parse`] before a `Header`
-/// exists, so nothing here needs re-checking — but the two that describe the frame's own shape
-/// (`frame_words`, `hdr_words`) are kept because stepping over a frame is done by length, never by
-/// scanning for the next magic.
+/// exists; `frame_words` and `hdr_words` are kept because stepping over a frame is done by length,
+/// never by scanning for the next magic.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Header {
     /// Shared-timebase ticks at which this frame was sampled, 48 significant bits. ONE free-running
     /// counter per device, sampled per frame by every section, so aligning two streams is exact
-    /// integer subtraction. Frame-to-frame deltas JITTER by design — at 30 kS/s the exact period is
-    /// 10000/3 ticks, so consecutive gaps alternate 3333/3334 and no constant-delta rule is
-    /// implementable.
+    /// integer subtraction. Deltas JITTER by design: 30 kS/s is 10000/3, so gaps run 3333/3334.
     pub timestamp: u64,
     /// The header flag word, reserved bits already rejected.
     pub flags: Flags,
@@ -169,7 +135,7 @@ pub struct Header {
     /// per-stream rule keyed on `run_id` must compare within it and not across it.
     pub run_id: u16,
     /// OPAQUE: a cache key for a derived kind/lane -> channel mapping, never a branch
-    /// (`kdi/contract.yaml:275-281`).
+    /// (`kdi/contract.yaml:83-83`).
     pub layout: u16,
     /// The WHOLE frame in 16-bit words, trailer included. A multiple of 4, and the only way to step
     /// over a frame — including one whose `format` this build does not decode.
@@ -183,7 +149,7 @@ pub struct Header {
     /// additive, and the frame is self-describing either way.
     pub contract_rev: u16,
     /// The descriptor stride ON THE WIRE. Never assume `DESC_WORDS_MIN` (`desc_stride`,
-    /// `kdi/contract.yaml:379`).
+    /// `kdi/contract.yaml:97`).
     pub desc_words: u16,
 }
 
@@ -211,10 +177,8 @@ pub struct SectionDesc {
 }
 
 // ─────────────────────────────────────────────────────────────────────── little-endian reads
-//
-// Every read is bounds-checked and returns Option. A decoder whose inputs are hostile-by-default
-// (a truncated USB read is the normal case, not the exception) must have no panicking path at all:
-// this crate is linked into hosts that record for hours.
+// Every read is bounds-checked and returns Option. A decoder whose inputs are hostile by default (a
+// truncated USB read is the normal case) must have no panicking path: hosts record for hours.
 
 fn rd16(b: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
@@ -255,14 +219,9 @@ pub struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    /// Validate and decode one format-2 frame at the start of `bytes`. Trailing bytes are ignored,
-    /// so a caller may hand over a whole read; [`Frame::bytes`] gives back exactly this frame.
-    ///
-    /// The `format` field is NOT checked here. An unrecognised format must be SKIPPED by
-    /// `frame_words`, never rejected (`unknown_kind`, `kdi/contract.yaml:395`), and there is
-    /// therefore no reject token for it — skipping is [`Walk`]'s job. A caller that parses frames
-    /// itself must gate on `format` (frozen at `OFF_FORMAT` for every present and future format)
-    /// before calling this, or use [`Walk`].
+    /// Validate and decode one format-2 frame at the start of `bytes`; trailing bytes are ignored.
+    /// `format` is NOT checked here — an unrecognised one must be SKIPPED by `frame_words`
+    /// (`unknown_kind`, :395), [`Walk`]'s job, so a caller framing its own reads must gate on it.
     pub fn parse(bytes: &'a [u8]) -> Result<Frame<'a>, RejectAt> {
         // Length first, and before the CRC: the declared length is what says where the CRC even is.
         if bytes.len() < HDR_BYTES {
@@ -271,15 +230,13 @@ impl<'a> Frame<'a> {
         let frame_words =
             rd32(bytes, OFF_FRAME_WORDS).ok_or(RejectAt::at(Reject::BadLength, OFF_FRAME_WORDS))?;
         let min_words = (HDR_BYTES + CRC_BYTES) as u32 / 2;
-        // `alignment`, contract.yaml:367 — frame_words % 4 == 0.
+        // `alignment`, contract.yaml:97 — frame_words % 4 == 0.
         if frame_words % 4 != 0 || frame_words < min_words {
             return Err(RejectAt::at(Reject::BadLength, OFF_FRAME_WORDS));
         }
-        // u64, not `as usize * 2`: `frame_words` is a raw wire u32 bounded only by the two checks
-        // above, so it reaches 0xFFFFFFFC and doubling it leaves 32 bits. On a 32-bit host — and
-        // this crate builds for riscv32imc-unknown-none-elf — that multiply is an overflow panic in
-        // debug and a WRAP in release, and a wrapped `total` then passes `bytes.get(..total)` and
-        // slices a live frame out of four bytes of hostile input, upstream of the CRC.
+        // u64, not `as usize * 2`: `frame_words` is raw wire bounded only by the checks above, so
+        // it reaches 0xFFFFFFFC and doubling leaves 32 bits — on a 32-bit host (this crate builds
+        // riscv32imc) that WRAPS in release and slices a live frame out of hostile input.
         let total = frame_words as u64 * 2;
         let f = usize::try_from(total)
             .ok()
@@ -287,7 +244,7 @@ impl<'a> Frame<'a> {
             .ok_or(RejectAt::at(Reject::BadLength, OFF_FRAME_WORDS))?;
         let total = f.len();
 
-        // `crc_residue`, contract.yaml:377: the residue form, so no separate slice of the payload.
+        // `crc_residue`, contract.yaml:97: the residue form, so no separate slice of the payload.
         if crc32(f) != CRC_RESIDUE {
             return Err(RejectAt::at(Reject::CrcErr, total - CRC_BYTES));
         }
@@ -320,28 +277,22 @@ impl<'a> Frame<'a> {
             return Err(RejectAt::at(Reject::DescWords, OFF_DESC_WORDS));
         }
 
-        // hdr_words is bounded from BOTH sides, and the lower bound is the load-bearing one: the
-        // lane-id block is located from `HDR_BYTES + n * desc_words * 2` while the bodies are
-        // located from `hdr_words`, so a frame whose hdr_words disagrees with its own descriptor
-        // block used to decode silently with the body read from the wrong offset. The
-        // device-reachable form is a wrong hdrWords formula in KdiRhdFrame.scala: the SAMPLES stay
-        // right and the LANE IDS come back as amplifier codes — correct data under wrong channel
-        // labels, which nothing downstream can detect (kdi/frame.py:196-214).
+        // hdr_words is bounded BOTH sides; the LOWER bound is load-bearing: lane ids come from
+        // the descriptor block, bodies from `hdr_words`, so a mismatch (a wrong hdrWords in
+        // KdiRhdFrame.scala) decodes right samples under wrong labels (kdi/frame.py:56-56).
         let hdr_bytes = hdr.hdr_words as usize * 2;
         if hdr_bytes > total - CRC_BYTES {
             return Err(RejectAt::at(Reject::HdrWordsFits, OFF_HDR_WORDS));
         }
         // `alignment` again (hdr_words % 4). Rejected under the EXISTING hdr_words_fits token on
         // purpose: a new token is new vocabulary every third-party decoder would have to
-        // reproduce, and the frame is rejected either way (kdi/frame.py:206-211).
+        // reproduce, and the frame is rejected either way (kdi/frame.py:56-56).
         if !hdr.hdr_words.is_multiple_of(4) {
             return Err(RejectAt::at(Reject::HdrWordsFits, OFF_HDR_WORDS));
         }
-        // LOAD-BEARING, and not merely the mirror of kdi/frame.py:212-214 it looks like: every
-        // descriptor offset below is `DESCRIPTORS_AT + i * desc_words * 2` with i < n_sections, so
-        // this one comparison is what bounds all of them before a single descriptor byte is read.
-        // Computed in u64 because both factors are raw u16s — 0xFFFF * 0xFFFF * 2 is 8.6e9, which
-        // wraps on a 32-bit usize and would turn the bound into a no-op.
+        // LOAD-BEARING: every descriptor offset below is `DESCRIPTORS_AT + i * desc_words * 2`, so
+        // this one comparison bounds all of them before a descriptor byte is read. u64 because both
+        // factors are raw u16s — 0xFFFF * 0xFFFF * 2 is 8.6e9, which wraps a 32-bit usize.
         let descs_end = DESCRIPTORS_AT as u64 + hdr.n_sections as u64 * hdr.desc_words as u64 * 2;
         if descs_end > hdr_bytes as u64 {
             return Err(RejectAt::at(Reject::HdrWordsFits, OFF_HDR_WORDS));
@@ -359,28 +310,22 @@ impl<'a> Frame<'a> {
                 return Err(RejectAt::at(Reject::ReservedBits, off + DOFF_DFLAGS));
             }
             // Reject, not ignore: two implementations that differ here diverge permanently the day
-            // anything is put in this slot (`reserved_reject`, contract.yaml:380).
+            // anything is put in this slot (`reserved_reject`, contract.yaml:97).
             if rd16(f, off + DOFF_PAD).ok_or(RejectAt::at(Reject::HdrWordsFits, off))? != 0 {
                 return Err(RejectAt::at(Reject::ReservedBits, off + DOFF_PAD));
             }
             let d = desc_at(f, hdr.desc_words, i).ok_or(RejectAt::at(Reject::HdrWordsFits, off))?;
             // A zero divides by zero in the published loss oracle, in every host
-            // (`tick_sane`, contract.yaml:381).
+            // (`tick_sane`, contract.yaml:97).
             if d.tick_num < 1 || d.tick_den < 1 {
                 return Err(RejectAt::at(Reject::TickSane, off + DOFF_TICK_NUM));
             }
             if d.section_words as u32 != section_words(d.n_lanes, d.rows, d.element_bits) {
                 return Err(RejectAt::at(Reject::SectionWords, off + DOFF_SECTION_WORDS));
             }
-            // Lane ids ascend and are unique WITHIN a section (contract.yaml:393). Descending ids
-            // decode to real values under a decoder that does not check, so the samples are right
-            // and the channel labels are wrong — the class of defect nothing downstream can detect
-            // (kdi/golden.py:217-221).
-            // Overflow guard, and the same rejection the lane read below would give anyway:
-            // `lane_off` accumulates n_lanes*2 over up to 65535 sections, so it reaches 8.6e9 and
-            // WRAPS on a 32-bit usize — after which `lane_off + l * 2` indexes an arbitrary place
-            // inside the frame instead of failing, and the lane ids come back from the body.
-            // Bounded by the frame here, by `hdr_words` after the loop.
+            // Lane ids ascend and are unique WITHIN a section (contract.yaml:97): descending ids
+            // decode to real values, so the samples are right and the labels wrong — undetectable
+            // downstream (kdi/golden.py:32-36). Also an overflow guard: `lane_off` wraps 32-bit.
             if lane_off > f.len() {
                 return Err(RejectAt::at(Reject::HdrWordsFits, OFF_HDR_WORDS));
             }
@@ -465,7 +410,7 @@ impl<'a> Frame<'a> {
     }
 
     /// `Ok(None)` = absent, `Err` = duplicated. TWO channels for two kinds of absence, because
-    /// `dup_kinds_ok` (contract.yaml:394) makes duplicates LEGAL and returning the first silently
+    /// `dup_kinds_ok` (contract.yaml:97) makes duplicates LEGAL and returning the first silently
     /// hands back half the data.
     pub fn section(&self, kind: u8) -> Result<Option<Section<'a>>, Ambiguous> {
         let count = self.sections_of(kind).count();
@@ -518,7 +463,7 @@ impl<'a> Section<'a> {
     }
 
     /// `None` = a kind this build does not know. Legal, and the caller must skip the section by
-    /// `section_words` rather than treat it as a fault (`unknown_kind`, contract.yaml:395).
+    /// `section_words` rather than treat it as a fault (`unknown_kind`, contract.yaml:97).
     pub fn kind(&self) -> Option<Kind> {
         Kind::from_code(self.desc.kind)
     }
@@ -537,13 +482,9 @@ impl<'a> Section<'a> {
         rd16(self.lanes, i as usize * 2)
     }
 
-    /// ROW-MAJOR: `body + (row * n_lanes + lane) * element_bits/8`; a 1-bit body packs LSB = first
-    /// lane. All four widths normalise to u64 so one accessor covers dflags 0..3.
-    ///
-    /// Row-major is normative and is NOT observable in a single-row frame: a decoder that indexes
-    /// `(lane * rows + row)` produces identical bytes when rows == 1, and on rhd_matrix (35 rows)
-    /// the same decoder yields plausible neural data at the wrong channel index — the failure PR
-    /// #15 shipped once already (contract.yaml:250-256).
+    /// ROW-MAJOR: `body + (row * n_lanes + lane) * element_bits/8`; a 1-bit body packs LSB =
+    /// first lane. NOT observable at rows == 1: a `(lane * rows + row)` decoder yields
+    /// plausible data at the wrong channel on rhd_matrix's 35 rows — PR #15, :250-256.
     pub fn element(&self, row: u16, lane: u16) -> Option<u64> {
         if row >= self.desc.rows || lane >= self.desc.n_lanes {
             return None;
@@ -551,7 +492,7 @@ impl<'a> Section<'a> {
         let (row, lane, n) = (row as usize, lane as usize, self.desc.n_lanes as usize);
         if self.desc.element_bits == 1 {
             // ceil(n_lanes/16) little-endian words per row, LSB first: 16 digital lines cost ONE
-            // word (`bit_packed`, contract.yaml:240-242).
+            // word (`bit_packed`, contract.yaml:97-97).
             let per_row = n.div_ceil(16);
             let w = rd16(self.body, (row * per_row + (lane >> 4)) * 2)?;
             return Some(((w >> (lane & 15)) & 1) as u64);
@@ -584,7 +525,7 @@ impl<'a> Section<'a> {
     }
 
     /// Ticks per sample as an exact rational. RATE IS NEVER NORMATIVE IN THIS CONTRACT, THE
-    /// TIMEBASE IS (contract.yaml:301-313): 30 kS/s is 10000/3, and an integer 3333 drifts 1.44 s
+    /// TIMEBASE IS (contract.yaml:123-127): 30 kS/s is 10000/3, and an integer 3333 drifts 1.44 s
     /// over a four-hour recording.
     pub fn cadence(&self) -> (u32, u16) {
         (self.desc.tick_num, self.desc.tick_den)
@@ -593,7 +534,7 @@ impl<'a> Section<'a> {
 
 // ─────────────────────────────────────────────────────────────────────── walk
 
-/// The three decoder counters (contract.yaml:433-437). They are things a conforming decoder does
+/// The three decoder counters (contract.yaml:153-153). They are things a conforming decoder does
 /// QUIETLY — a mismatch on the published stream vector is the only way to test that it did.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Counters {
@@ -605,15 +546,9 @@ pub struct Counters {
     pub format_skipped: usize,
 }
 
-/// Decode every whole frame in a blob.
-///
-/// TOTAL and chunk-insensitive: one corrupt frame is ONE `Err` item and the walk carries on. The
-/// Python reference raises out of `walk()`, which destroys every frame it had already decoded plus
-/// the tail (the Python reference host) — a host that reads 64 KB at a time then loses 60 KB of good
-/// data to one flipped bit. Do not reproduce that.
-///
-/// After the iterator returns `None`, [`Walk::tail`] is the unconsumed remainder to carry into the
-/// next read: a pipe read is rounded up to whole blocks, so a frame routinely straddles two of them.
+/// Decode every whole frame in a blob. TOTAL and chunk-insensitive: one corrupt frame is ONE `Err`
+/// item and the walk carries on — the Python reference raises out of `walk()` and loses every frame
+/// already decoded. After `None`, [`Walk::tail`] is the remainder to carry into the next read.
 pub struct Walk<'a> {
     blob: &'a [u8],
     pos: usize,
@@ -659,7 +594,7 @@ impl<'a> Iterator for Walk<'a> {
                 return None;
             }
             if rd32(self.blob, self.pos)? != MAGIC {
-                // Resync — the anchor's ONLY job (`magic_is_anchor`, contract.yaml:368).
+                // Resync — the anchor's ONLY job (`magic_is_anchor`, contract.yaml:97).
                 match find_magic(self.blob, self.pos + 1) {
                     Some(next) => {
                         self.counters.resync_bytes += next - self.pos;
@@ -683,11 +618,9 @@ impl<'a> Iterator for Walk<'a> {
                 self.counters.resync_bytes += 1;
                 return Some(Err(RejectAt::at(Reject::BadLength, base + OFF_FRAME_WORDS)));
             }
-            // u64 for the same reason as `Frame::parse`: `frame_words` is four bytes of unverified
-            // wire, so on a 32-bit usize `base + frame_words * 2` wraps to a SMALL `end`, sails past
-            // the bound below and then panics slicing `blob[base..end]` with base > end. Four bytes
-            // of hostile input, upstream of the CRC — and this crate's promise is that there is no
-            // panicking path at all (module docs).
+            // u64 for the same reason as `Frame::parse`: on a 32-bit usize `base + frame_words * 2`
+            // wraps to a SMALL `end`, sails past the bound below and then panics slicing with
+            // base > end — four bytes of hostile input, against a no-panicking-path promise.
             let end = base as u64 + frame_words as u64 * 2;
             if end > self.blob.len() as u64 {
                 return None; // a partial trailing frame: carry it, do not judge it
@@ -695,7 +628,7 @@ impl<'a> Iterator for Walk<'a> {
             let end = end as usize;
             // An unrecognised format is SKIPPABLE BY LENGTH: magic/format/frame_words are frozen at
             // these offsets for every present and future format, which is what makes this safe
-            // (contract.yaml:258-264).
+            // (contract.yaml:97-97).
             if rd16(f, OFF_FORMAT)? != FORMAT {
                 self.counters.format_skipped += 1;
                 self.pos = end;
@@ -724,15 +657,9 @@ impl<'a> Iterator for Walk<'a> {
     }
 }
 
-/// The one CROSS-FRAME rule, exported separately so [`Walk`] stays a pure function of its blob — a
-/// decoder's verdict must not depend on the caller's chunk size.
-///
-/// `first_of_run` frames mark segment starts, so their timestamps must strictly increase within a
-/// `run_id`. Two weaker rules came first and the history is the argument for this one: "timestamp
-/// must be 0" is unsatisfiable for independently started streams on a shared timebase and ACCEPTED
-/// the real defect (31 consecutive flagged frames all stamped 0, this project #78); "at most one
-/// per run_id" rejects a healthy restart, because `run_id` is the DEVICE-WIDE epoch
-/// (the Python reference host).
+/// The one CROSS-FRAME rule, exported separately: [`Walk`] stays a pure function of its blob —
+/// a verdict must not depend on chunk size. `first_of_run` stamps strictly increase WITHIN a
+/// `run_id`: "must be 0" accepted #78 (31 flagged frames at 0).
 pub fn check_run_announcements(headers: &[Header]) -> Result<(), Reject> {
     for (i, h) in headers.iter().enumerate() {
         if !h.flags.first_of_run() {
@@ -754,14 +681,9 @@ pub fn check_run_announcements(headers: &[Header]) -> Result<(), Reject> {
 
 // ─────────────────────────────────────────────────────────────────────── helpers
 
-/// Frames lost between two timestamps of ONE stream: `round(dt * den / num) - 1`.
-///
-/// Never across streams — they are independently sampled and share only the timebase
-/// (`loss_oracle`, contract.yaml:396; `not_co_sampled`, :413).
-///
-/// Reproduces Python's HALF-TO-EVEN tie break in integer arithmetic. A naive `(x + 0.5) as i64`
-/// diverges silently at exact ties, and ties are not exotic here: at 100 MHz against a 10000/3
-/// cadence, dt values landing on a half-frame boundary are routine.
+/// Frames lost between two timestamps of ONE stream: `round(dt * den / num) - 1`. Never across
+/// streams (`loss_oracle`, contract.yaml:97; `not_co_sampled`, :413). Reproduces Python's
+/// HALF-TO-EVEN tie break: `(x + 0.5) as i64` diverges, and ties are routine at 10000/3.
 pub fn lost_frames(dt_ticks: u64, tick_num: u32, tick_den: u16) -> Result<i64, Reject> {
     if tick_num < 1 || tick_den < 1 {
         return Err(Reject::TickSane);
@@ -781,32 +703,19 @@ pub fn lost_frames(dt_ticks: u64, tick_num: u32, tick_den: u16) -> Result<i64, R
 }
 
 /// Body length of a section in 16-bit words: `rows * ceil(n_lanes * element_bits / 16)`.
-///
 /// Generalises `n_lanes * rows`, which is only the 16-bit case (`section_words`,
-/// contract.yaml:378). SATURATES at `u32::MAX` — see below for why that is the right answer and not
-/// merely a safe one.
+/// contract.yaml:97). SATURATES at `u32::MAX` — see below for why that is the right answer.
 pub fn section_words(n_lanes: u16, rows: u16, element_bits: u8) -> u32 {
-    // u64 then saturate. All three arguments come STRAIGHT OFF THE WIRE — `desc_at` reads them
-    // before any geometry check, which is what this function is for — so 65535 rows of 65535
-    // 64-bit lanes is reachable from a descriptor a device controls, and that is 1.7e10 words: the
-    // old `rows as u32 * ...` panicked in debug and WRAPPED in release, upstream of every check
-    // below it (`tests/codec_robustness.rs`, "geometry overflows u32").
-    //
-    // Saturating rather than `Option`: `section_words` on the wire is a u16, so a saturated value
-    // can never equal it and the frame is rejected as `section_words` at lib.rs:364 — which is
-    // exactly what a section claiming 1.7e10 words of body IS. A wrapped value could have matched,
-    // and then only `body_fits_frame` stood between it and a body read at the wrong offset.
+    // u64 then saturate. All three arguments come STRAIGHT OFF THE WIRE, so 65535 rows of 65535
+    // 64-bit lanes is 1.7e10 words: `rows as u32 * ...` panicked in debug and WRAPPED in
+    // release. Saturating, not `Option`: a u16 `section_words` can never equal u32::MAX.
     let w = rows as u64 * (n_lanes as u64 * element_bits as u64).div_ceil(16);
     w.min(u32::MAX as u64) as u32
 }
 
 /// The largest burst <= `want` whose byte total is a multiple of `alignment`, or the smallest legal
-/// one. `None` for a zero argument.
-///
-/// `alignment` is a PARAMETER — 16 is a usb3 pipe property (`bindings.usb3.read_alignment`,
-/// contract.yaml:715), not a codec constant, and an ethernet binding has a different one or none.
-/// A bounded capture has no next read, so an unaligned burst leaves a partial group behind that
-/// nothing can retrieve (`burst_alignment`, contract.yaml:389-390).
+/// one; `None` for a zero argument. `alignment` is a PARAMETER — 16 is a usb3 pipe property (:715).
+/// A bounded capture has no next read, so an unaligned burst strands a partial group (:389-390).
 pub fn aligned_burst(frame_bytes: u32, want: u32, alignment: u32) -> Option<u32> {
     let step = alignment_step(frame_bytes, want, alignment)?;
     Some(((want / step) * step).max(step))
@@ -831,12 +740,9 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
-/// CRC-32/ISO-HDLC (a.k.a. CRC-32, zlib/PKZIP): poly 0x04C11DB7, reflected 0xEDB88320, init
-/// 0xFFFFFFFF, refin/refout true, xorout 0xFFFFFFFF. Check value 0xCBF43926 over `"123456789"`
-/// (`crc_algorithm`, contract.yaml:373-374).
-///
-/// Written out rather than pulled in: the whole claim of this crate is that it depends on nothing,
-/// and a table-driven CRC is 20 lines.
+/// CRC-32/ISO-HDLC (zlib/PKZIP): poly 0x04C11DB7, reflected 0xEDB88320, init 0xFFFFFFFF,
+/// refin/refout true, xorout 0xFFFFFFFF; check value 0xCBF43926 over `"123456789"`
+/// (`crc_algorithm`, contract.yaml:97-97). Written out because this crate depends on nothing.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut c = !0u32;
     for b in data {
@@ -866,9 +772,8 @@ const CRC_TABLE: [u32; 256] = {
 };
 
 // The three helpers the vector bundle does NOT cover — it publishes frames, and these take
-// numbers. Expected values produced by the reference implementation itself
-// (`python3 -c "import kdi.frame as f; f.lost_frames(...)"`), so this is still a cross-check
-// against Python and not against my own arithmetic.
+// numbers. Expected values produced by the reference implementation itself (`python3 -c "import
+// kdi.frame as f; f.lost_frames(...)"`), so still a cross-check against Python.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,16 +795,9 @@ mod tests {
         assert_eq!(lost_frames(1, 1, 0), Err(Reject::TickSane));
     }
 
-    /// Four bytes of hostile input must not be able to panic the decoder.
-    ///
-    /// `frame_words` is used to size the frame BEFORE anything has verified it — it is upstream of
-    /// the CRC, and a CRC is not a MAC in any case — so it arrives as anything up to 0xFFFFFFFC,
-    /// and doubling that needs 33 bits. On a 32-bit usize (this crate builds for
-    /// riscv32imc-unknown-none-elf) `frame_words as usize * 2` panicked outright in debug and
-    /// WRAPPED in release, after which the small wrapped `end` sailed through the bounds check and
-    /// `blob[base..end]` panicked with base > end. The module header promises no panicking path at
-    /// all; this asserts the part of that promise which is visible on every target — rejected, and
-    /// carried rather than judged — because the wrap itself cannot be reached on a 64-bit runner.
+    /// Four hostile bytes must not panic the decoder: `frame_words` sizes the frame upstream of
+    /// the CRC, so it arrives as anything up to 0xFFFFFFFC, and on 32-bit usize `as usize * 2`
+    /// panicked in debug, WRAPPED in release. Asserts reject-and-carry on any target.
     #[test]
     fn a_hostile_frame_words_is_rejected_not_slice_indexed() {
         let mut b = [0u8; 64];
@@ -917,13 +815,9 @@ mod tests {
         }
     }
 
-    /// `run_id` is the DEVICE-WIDE epoch, so two streams can hold one open and announce
-    /// independently — the rule is per-run_id, not global (contract.yaml:391-392).
-    ///
-    /// No vector can show this: the published stream blob carries one announcement, so dropping the
-    /// `p.run_id == h.run_id` filter passes the whole conformance suite while rejecting a healthy
-    /// restart on real hardware. Interleaved on purpose — a run_id-BLIND scan sees 10, 5, 20 and
-    /// rejects the 5.
+    /// `run_id` is the DEVICE-WIDE epoch, so the rule is per-run_id, not global (:391-392). No
+    /// vector shows it: dropping the `p.run_id == h.run_id` filter passes the whole conformance
+    /// suite while rejecting a healthy restart. Interleaved — a run_id-BLIND scan sees 10, 5, 20.
     #[test]
     fn run_announcements_are_scoped_to_their_run_id() {
         fn ann(run_id: u16, timestamp: u64, first: bool) -> Header {
@@ -942,7 +836,8 @@ mod tests {
         let two_runs = [ann(1, 10, true), ann(2, 5, true), ann(1, 20, true)];
         assert_eq!(check_run_announcements(&two_runs), Ok(()));
         // ...and within ONE run_id the stamps must still strictly increase: 31 consecutive
-        // announcements all stamped 0 is the defect this rule exists for (issue #78 in the reference implementation).
+        // announcements all stamped 0 is the defect this rule exists for (issue #78 in the
+        // reference implementation).
         let repeat = [ann(1, 7, true), ann(2, 99, true), ann(1, 7, true)];
         assert_eq!(check_run_announcements(&repeat), Err(Reject::FirstOfRunDup));
         // An unflagged frame is not an announcement, however its stamp compares.
@@ -977,14 +872,9 @@ mod tests {
         assert_eq!(section_words(20, 1, 1), 2); // 20 bit-packed lanes -> ceil(20/16) words
         assert_eq!(section_words(2, 35, 16), 70);
         assert_eq!(section_words(3, 2, 32), 12);
-        // SATURATION, asserted in ARITHMETIC and not via an overflow panic. robustness.rs's
-        // "geometry overflows u32" case only catches the pre-fix `rows as u32 * …` because DEBUG
-        // builds check overflow: measured, the same mutant is GREEN under `--release`, which is
-        // the profile a host ships. The second line is worse than the first and is why an exact
-        // value is asserted rather than "big": 65535 * ceil(32769*32/16) wraps to 65534, a value a
-        // u16 wire `section_words` CAN equal, so the geometry check at lib.rs:364 would pass and
-        // only body_fits_frame would stand between a hostile descriptor and a body read at the
-        // wrong offset.
+        // SATURATION asserted in ARITHMETIC, not by a panic: robustness.rs only catches the
+        // pre-fix `rows as u32 * ...` because DEBUG checks overflow — measured, that mutant is
+        // GREEN under `--release`. Line two wraps to 65534, which a u16 CAN equal.
         assert_eq!(section_words(u16::MAX, u16::MAX, 64), u32::MAX);
         assert_eq!(section_words(32769, u16::MAX, 32), u32::MAX);
     }

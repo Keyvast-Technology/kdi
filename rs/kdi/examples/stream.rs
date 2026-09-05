@@ -1,22 +1,6 @@
-//! Acquire from a device and print records. NO HARDWARE NEEDED.
-//!
-//! This runs against the software device model over the UDP binding. From the repo root, in one
-//! terminal:
-//!
-//! ```text
-//! ```
-//!
-//! and in another:
-//!
-//! ```text
-//! cargo run --example stream                 # first device found
-//! cargo run --example stream -- KVDEMO       # that serial specifically
-//! ```
-//!
-//! The server announces itself into `$KDI_DISCOVERY_DIR` (default: `kdi-discovery` under the
-//! system temp dir), which is where `kdi::find` looks — so if you set that variable, set it for
-//! both processes. Nothing below is transport-specific: point it at a board over `--features
-//! usb3` and the same code runs.
+//! Acquire from a device and print records. NO HARDWARE NEEDED: runs against the software device
+//! model over the UDP binding, which announces into `$KDI_DISCOVERY_DIR` (default `kdi-discovery`
+//! in the temp dir) where `kdi::find` looks — set it for BOTH processes. `stream [SERIAL]`.
 
 use std::time::Duration;
 
@@ -49,9 +33,8 @@ fn main() -> Result<(), kdi::Error> {
     let mut dev = Device::open(info, &ConnectOpts::default())?;
 
     // EVERY HOST OWES THIS WRITE (#131, contract 0.5). An unconfigured device emits nothing on
-    // `rhd_matrix`, and before the capability existed it emitted one frame per twenty sample
-    // periods while declaring the full cadence. Non-fatal, so this still runs against pre-0.5
-    // gateware, where the rate is whatever the last host left.
+    // `rhd_matrix`; before the capability existed it emitted one frame per twenty sample periods
+    // while declaring the full cadence. Non-fatal: pre-0.5 gateware keeps whatever rate was left.
     if let Err(e) = dev.set_rate(42, 25) {
         eprintln!("note: rate not configured ({e}) - pre-0.5 gateware");
     }
