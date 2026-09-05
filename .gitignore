@@ -1,2 +1,4 @@
 rs/target/
 rs/kdi/vendor/
+__pycache__/
+*.py[cod]
