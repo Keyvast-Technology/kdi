@@ -7,27 +7,29 @@
 # `rs/` is a ONE-WAY MIRROR written by the private build repo. Do not edit it here -- the next sync
 # overwrites it. Fixes land upstream and appear here on the following release.
 #
+# ONE PATH UPLOADS: a maintainer pushes a `vX.Y.Z` tag. The tag VALIDATES and never rewrites -- it
+# must equal the crate's declared version, whose major.minor must equal the generated contract
+# version, and it must be a number crates.io has never seen. A manual dispatch rehearses the same
+# checks and cannot upload, which is why there is no `dry_run` input left to get wrong.
+#
 # A crates.io version is PERMANENT: never deletable, only yankable, and its files are served
-# forever. So this never fires on a push or a tag, it defaults to a rehearsal, and the gate below
-# refuses a tarball that leaks or misdeclares. Every check in that gate is a defect that was found
-# in a real tarball, hours before a first publish that would have shipped a bench instrument's
-# serial number and the board vendor's name.
+# forever. Hence the gate below, which refuses a tarball that leaks or misdeclares -- every check in
+# it is a defect found in a real tarball hours before a first publish that would have shipped a
+# bench instrument's serial number and the board vendor's name -- and hence the last step, which
+# asks the registry whether the upload happened rather than believing a zero exit.
 name: Publish to crates.io
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (must match rs/Cargo.toml exactly)"
-        required: true
-      dry_run:
-        description: "Rehearse only -- package and gate, never upload"
-        type: boolean
-        default: true
 
 concurrency: publish-crate
 permissions:
   contents: read
+
+env:
+  CRATE: kdi
 
 jobs:
   publish:
@@ -36,13 +38,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: The version must be the one in the manifest
+      # A tag is the only thing that can upload, so the tag name is parsed here and nowhere else.
+      # It reaches the shell through the environment, never through `${{ }}` interpolation: a ref
+      # name is attacker-shaped text and interpolation would splice it into this script.
+      - name: Resolve the version and the mode
+        id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          want='${{ inputs.version }}'
-          have=$(grep -m1 '^version' rs/Cargo.toml | cut -d'"' -f2)
-          [ "$want" = "$have" ] || { echo "::error::asked for $want, manifest says $have"; exit 1; }
-          echo "version $have"
+          if [ "$REF_TYPE" = tag ]; then
+            want=${REF_NAME#v}
+            printf '%s' "$want" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+              echo "::error::$REF_NAME is not a vX.Y.Z crate tag. spec-v* is the contract and gateware-v* is a bitstream; neither publishes a crate."
+              exit 1; }
+          else
+            want=$(grep -m1 '^version' rs/Cargo.toml | cut -d'"' -f2)
+          fi
+          # A dispatch rehearses even when it is aimed at a tag ref, so the tag path can be proven
+          # before anyone pushes the tag that makes it permanent.
+          if [ "$EVENT" = push ]; then dry=false; else dry=true; fi
+          echo "version=$want" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
+          echo "version $want, dry_run $dry, from $REF_TYPE $REF_NAME"
+
+      # Two refusals the tag can only lose. `codec/mod.rs` already asserts at COMPILE TIME that the
+      # crate version is `<KDI_VERSION>.<patch>`; this is the readable early failure for the same
+      # disagreement, before a five-minute build reports it as a const-eval error.
+      - name: The tag must match the manifest and the generated contract version
+        env:
+          WANT: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version' rs/Cargo.toml | cut -d'"' -f2)
+          [ "$WANT" = "$manifest" ] || {
+            echo "::error::tag says $WANT, rs/Cargo.toml says $manifest. The tag never rewrites the manifest -- fix the tag, or land the version bump upstream first."
+            exit 1; }
+          spec=$(grep -m1 'pub const KDI_VERSION' rs/kdi/src/codec/spec.rs | cut -d'"' -f2)
+          [ -n "$spec" ] || { echo "::error::no KDI_VERSION in rs/kdi/src/codec/spec.rs"; exit 1; }
+          [ "${WANT%.*}" = "$spec" ] || {
+            echo "::error::crate $WANT is major.minor ${WANT%.*}, but the generated contract version is $spec. The crate version tracks the contract; only the patch is free."
+            exit 1; }
+          echo "version $WANT, contract $spec"
+
+      # BEFORE PACKAGING, because the answer cannot change in our favour later and everything after
+      # this point costs minutes.
+      - name: Refuse a version already on crates.io
+        env:
+          WANT: ${{ steps.v.outputs.version }}
+        run: python3 .github/crates_io.py absent "$CRATE" "$WANT"
 
       # The device drivers are fetched, never tracked -- four opaque binaries cost more in
       # comprehension than they save, and they travel in the crates.io tarball instead. They live in
@@ -53,40 +99,81 @@ jobs:
           client-id: ${{ vars.VENDOR_APP_CLIENT_ID }}
           private-key: ${{ secrets.VENDOR_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: hdl-opalkelly-xem7310
+          repositories: ${{ vars.VENDOR_DRIVER_REPO }}
           permission-contents: read
 
       - name: Fetch and hash-verify the device drivers
         env:
           GH_TOKEN: ${{ steps.vendor-token.outputs.token }}
-        run: tools/vendor_drivers.sh "$PWD/rs/kdi/vendor"
+          VENDOR_DRIVER_REPO: ${{ vars.VENDOR_DRIVER_REPO }}
+        # An unset variable would scope the token to nothing and fail four steps later, on a hash
+        # mismatch, which reads as a corrupt driver rather than a misconfigured repository.
+        run: |
+          set -euo pipefail
+          [ -n "${VENDOR_DRIVER_REPO:-}" ] || {
+            echo "::error::repository variable VENDOR_DRIVER_REPO is unset -- the driver source is configured, not hardcoded"
+            exit 1
+          }
+          tools/vendor_drivers.sh "$PWD/rs/kdi/vendor"
 
+      # `--locked` throughout: a lockfile the build updates is a dirty tree two steps later, and
+      # "the lockfile needs updating" is a better message than cargo refusing to package.
       - name: Test and lint
         run: |
           set -euo pipefail
           cd rs
-          cargo test -p kdi
-          cargo clippy -p kdi --all-targets -- -D warnings
+          cargo test -p kdi --locked
+          cargo clippy -p kdi --locked --all-targets -- -D warnings
 
+      # THIS is the clean-checkout gate, not `--allow-dirty`, and the difference is measured: cargo's
+      # own check is scoped to `rs/kdi`, so it passes over an uncommitted README, and it refuses over
+      # the four `include`d, gitignored drivers. Whole repository, one line, no exceptions.
+      - name: The checkout must be clean
+        run: |
+          set -euo pipefail
+          dirty=$(git status --porcelain)
+          [ -z "$dirty" ] || {
+            echo "::error::the checkout is not clean, so the published crate would not be reproducible from the commit it names"
+            echo "$dirty"
+            exit 1; }
+          echo "clean at $(git rev-parse HEAD)"
+
+      # `--allow-dirty` is load-bearing and cannot go: `vendor/*.bin` is `include`d and gitignored,
+      # and cargo counts exactly that as dirty (measured -- "4 files in the working directory
+      # contain changes"). Those four are hash-verified against `src/bundled.rs` two steps up, and
+      # the step above proves nothing else deviates from the commit.
       - name: Package
-        run: cd rs && cargo package -p kdi --allow-dirty
+        run: cd rs && cargo package -p kdi --locked --allow-dirty
 
       # THE GATE. Mirrored from the build repo so it runs where the publish happens.
       - name: Refuse an unpublishable tarball
-        run: python3 tools/check_publishable.py rs/target/package/kdi-${{ inputs.version }}.crate
+        env:
+          WANT: ${{ steps.v.outputs.version }}
+        run: python3 tools/check_publishable.py "rs/target/package/$CRATE-$WANT.crate"
 
       - name: Rehearse
-        if: ${{ inputs.dry_run }}
+        if: ${{ steps.v.outputs.dry_run == 'true' }}
         run: |
-          cd rs && cargo publish -p kdi --dry-run --allow-dirty
-          echo "::notice::dry run only -- nothing was uploaded"
+          set -euo pipefail
+          cd rs && cargo publish -p kdi --locked --dry-run --allow-dirty
+          echo "::notice::rehearsal only -- every check ran and nothing was uploaded"
 
       - name: Publish (PERMANENT)
-        if: ${{ !inputs.dry_run }}
+        if: ${{ steps.v.outputs.dry_run == 'false' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           [ -n "${CARGO_REGISTRY_TOKEN:-}" ] || { echo "::error::CARGO_REGISTRY_TOKEN is not set"; exit 1; }
-          cd rs && cargo publish -p kdi --allow-dirty
-          echo "::notice::kdi ${{ inputs.version }} is now public and permanent"
+          cd rs && cargo publish -p kdi --locked --allow-dirty
+
+      # THE MOST IMPORTANT STEP HERE. A publish believed to have happened that had not is a failure
+      # this project has already paid for, and a zero exit is not evidence against it.
+      - name: The registry must now serve it as the newest version
+        if: ${{ steps.v.outputs.dry_run == 'false' }}
+        env:
+          WANT: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .github/crates_io.py newest "$CRATE" "$WANT"
+          echo "::notice::$CRATE $WANT is now public and permanent"

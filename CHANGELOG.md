@@ -126,7 +126,7 @@ per contract version.
 
 **The typed command protocol is live on hardware.** The device now answers framed
 request/response commands over the control channel (capability `command_protocol`),
-verified on a real XEM7310: 10/10 cases including every negative path.
+verified on real hardware: 10/10 cases including every negative path.
 
 - Commands published: `sys.hello`, `power.status`, `power.up`, `adio.mode`, `adio.adc`.
   All five are implemented in the shipping firmware and hardware-verified.
