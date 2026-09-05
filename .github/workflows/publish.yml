@@ -99,13 +99,22 @@ jobs:
           client-id: ${{ vars.VENDOR_APP_CLIENT_ID }}
           private-key: ${{ secrets.VENDOR_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: hdl-opalkelly-xem7310
+          repositories: ${{ vars.VENDOR_DRIVER_REPO }}
           permission-contents: read
 
       - name: Fetch and hash-verify the device drivers
         env:
           GH_TOKEN: ${{ steps.vendor-token.outputs.token }}
-        run: tools/vendor_drivers.sh "$PWD/rs/kdi/vendor"
+          VENDOR_DRIVER_REPO: ${{ vars.VENDOR_DRIVER_REPO }}
+        # An unset variable would scope the token to nothing and fail four steps later, on a hash
+        # mismatch, which reads as a corrupt driver rather than a misconfigured repository.
+        run: |
+          set -euo pipefail
+          [ -n "${VENDOR_DRIVER_REPO:-}" ] || {
+            echo "::error::repository variable VENDOR_DRIVER_REPO is unset -- the driver source is configured, not hardcoded"
+            exit 1
+          }
+          tools/vendor_drivers.sh "$PWD/rs/kdi/vendor"
 
       # `--locked` throughout: a lockfile the build updates is a dirty tree two steps later, and
       # "the lockfile needs updating" is a better message than cargo refusing to package.
