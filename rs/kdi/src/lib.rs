@@ -560,6 +560,41 @@ impl Device {
         self.link.message(&id, name, args, &self.token)
     }
 
+    /// Raise this session's tier: `sys.challenge`, then `sys.unlock` carrying `sign`'s Ed25519
+    /// signature over [`grant_bytes`]. THE KEY NEVER ENTERS THIS CRATE — `sign` is the station's.
+    /// `Ok` is the accepting reply (`tier` is the tier reached); a refusal is [`Error::Device`]
+    /// with `tier_locked`, and a build with no unlock answers `unknown_cmd`. The grant is bound to
+    /// the device's own DNA; the wildcard (`dna` 0) is the same three calls on [`Device::raw_cmd`].
+    pub fn unlock_with(
+        &mut self,
+        tier: &str,
+        sign: impl FnOnce(&[u8]) -> [u8; 64],
+    ) -> Result<Reply, Error> {
+        let ch = self.raw_cmd("sys.challenge", &[])?;
+        if !ch.ok() {
+            return Err(Error::Device(ch));
+        }
+        let int = |k: &str| ch.get(k).and_then(Value::as_u64);
+        let (nonce, dna) = match (int("nonce").and_then(|n| u32::try_from(n).ok()), int("dna")) {
+            (Some(n), Some(d)) => (n, d),
+            _ => {
+                let why = format!("sys.challenge: no u32 `nonce` + u64 `dna` in {}", ch.body());
+                return Err(io_err(io::ErrorKind::InvalidData, why));
+            }
+        };
+        let sig: String = sign(&grant_bytes(tier, nonce, dna))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let args = [tier, &nonce.to_string(), &dna.to_string(), &sig];
+        let r = self.raw_cmd("sys.unlock", &args)?;
+        if r.ok() {
+            Ok(r)
+        } else {
+            Err(Error::Device(r))
+        }
+    }
+
     /// Release the lease and drop the link. Takes `self`, so a closed device cannot be used again.
     /// Always `Ok`: the release is best effort. Dropping a `Device` instead closes the transport
     /// just the same but skips the release, so the board stays claimed until its lease expires.
@@ -922,6 +957,7 @@ impl DeviceErr {
             DeviceErr::NoDevice => true, // a Zephyr device is not ready yet
             DeviceErr::Busy => true,     // another host's lease may expire
             DeviceErr::NotReady => true, // boot/calibration still running
+            DeviceErr::I2cNak => true,   // an EEPROM NAKs through its ~5 ms write cycle
             DeviceErr::BadArgs => false,
             DeviceErr::UnknownCmd => false,
             DeviceErr::TierLocked => false,
@@ -933,6 +969,7 @@ impl DeviceErr {
             DeviceErr::RoRegister => false,
             DeviceErr::NoSuchRegister => false,
             DeviceErr::ResponseTooLarge => false,
+            DeviceErr::I2cTimeout => false, // a held bus does not free itself
         }
     }
 }
@@ -945,9 +982,10 @@ impl DeviceErr {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// The device answered and REFUSED. Only the generated [`Commands`] methods mint this:
-    /// [`Device::raw_cmd`] returns `rc != 0` as data because its caller holds the `Reply`, but a
-    /// typed method asked for a value and a refusal has none — else a struct of zeros from no keys.
+    /// The device answered and REFUSED. Only the typed methods mint this — the generated
+    /// [`Commands`] and [`Device::unlock_with`]: [`Device::raw_cmd`] returns `rc != 0` as data
+    /// because its caller holds the `Reply`, but a typed method asked for a value and a refusal has
+    /// none — else a struct of zeros from no keys.
     Device(Reply),
     /// THIS HOST refused, and nothing went to the wire — an argument outside the contract's
     /// charset, a deadline that expired, a transport that returned less than its framing declared.
@@ -1063,6 +1101,18 @@ fn safe_token(t: &str) -> bool {
     !t.is_empty()
         && t.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
+/// THE SIGNING BYTES of a `sys.unlock` grant: the compact, key-sorted JSON the device rebuilds
+/// from the three positional args (`{"dna":<dna>,"nonce":<nonce>,"tier":"<tier>"}`), pinned byte
+/// for byte by `kdi/vectors/unlock_vectors.json`. Sign them with Ed25519 outside this crate — a
+/// station tool holds the key — and hand the 64-byte signature to [`Device::unlock_with`].
+pub fn grant_bytes(tier: &str, nonce: u32, dna: u64) -> Vec<u8> {
+    // `json!` keys come out sorted (serde_json's default map) — and dna, nonce, tier is ALSO the
+    // insertion order, so a downstream `preserve_order` feature cannot change these bytes.
+    serde_json::json!({"dna": dna, "nonce": nonce, "tier": tier})
+        .to_string()
+        .into_bytes()
 }
 
 // ─────────────────────────────────────────────────────────────────────────── checks

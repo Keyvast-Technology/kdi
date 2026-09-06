@@ -8,7 +8,7 @@ members = ["kdi"]
 [workspace.package]
 # Tracks the KDI CONTRACT version, not the repo's release tag; asserted equal to the generated
 # KDI_VERSION at COMPILE TIME, so a publish cannot disagree with the contract it claims.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # The toolchain these crates are ACTUALLY built and tested with (`rust-toolchain.toml` pins the
 # same). It was 1.75, checked by nothing, and a `c"..."` literal (1.77) sat in `usb3.rs` unspotted.

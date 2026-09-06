@@ -458,7 +458,13 @@ impl Usb3 {
         self.console.clear();
         self.send(&line, Duration::from_secs(2))?;
 
-        let deadline = Instant::now() + Duration::from_secs(4);
+        // The command's own `worst_ms`, doubled for margin, never below the 4 s floor. A flat wait
+        // made every slower command unreachable and the contract's published field decorative.
+        let worst = crate::spec::WORST_MS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(0, |(_, ms)| *ms);
+        let deadline = Instant::now() + Duration::from_millis(4_000.max(2 * worst));
         let mut scanned = 0usize;
         loop {
             let got = self.drain()?;

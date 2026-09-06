@@ -19,7 +19,7 @@
 // wire. Every range below comes from contract.yaml and is checked BEFORE a byte is sent; the
 // refusal is `HostErr::HostUnsafeArg`, which is the contract's own token for "refused by the host
 // before it reached the wire" — `host_errors` is a CLOSED set and a conforming library mints none
-// of its own (kdi/contract.yaml:88).
+// of its own (kdi/contract.yaml:93).
 
 #![allow(dead_code)]
 
@@ -30,17 +30,18 @@ use serde_json::Value;
 use crate::{io_err, Device, Error, HostErr, Reply};
 
 /// Every published command with its declared argument order. THE ORDER IS THE WIRE
-/// (`request.arg_order: declared`, kdi/contract.yaml:413), so a host serialising a
+/// (`request.arg_order: declared`, kdi/contract.yaml:874), so a host serialising a
 /// positional `Device::raw_cmd` call reads it from here instead of keeping a second copy of
 /// the registry — the copy that goes stale is the one that transposes two arguments.
-/// The RESERVED session commands are listed too: they have no typed method, but they are
+/// The `scope: session` commands are listed too: they have no typed method, but they are
 /// still callable through `Device::raw_cmd`.
 pub const COMMANDS: &[(&str, &[&str])] = &[
     ("sys.claim", &[]),
     ("sys.release", &[]),
     ("sys.challenge", &[]),
-    ("sys.unlock", &["grant", "sig"]),
+    ("sys.unlock", &["tier", "nonce", "dna", "sig"]),
     ("sys.hello", &[]),
+    ("id.boards", &["seg"]),
     ("power.status", &[]),
     ("power.up", &[]),
     ("adio.mode", &["slot", "ch1", "ch2"]),
@@ -48,6 +49,74 @@ pub const COMMANDS: &[(&str, &[&str])] = &[
     ("adio.dout", &["slot", "mask"]),
     ("adio.adc", &["slot", "ch", "n"]),
 ];
+
+/// A mode token, 1:1 with the contract's `of:` list. One enum for every argument that
+/// takes this value set — `adio.mode` declares it twice and two identical types would be
+/// two things to keep in step.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum SegBoards {
+    /// The contract token `main`.
+    Main,
+
+    /// The contract token `slot0`.
+    Slot0,
+
+    /// The contract token `slot1`.
+    Slot1,
+
+    /// The contract token `slot2`.
+    Slot2,
+
+    /// The contract token `slot3`.
+    Slot3,
+
+    /// The contract token `slot4`.
+    Slot4,
+
+    /// The contract token `slot5`.
+    Slot5,
+
+    /// The contract token `slot6`.
+    Slot6,
+
+    /// The contract token `slot7`.
+    Slot7,
+}
+
+impl SegBoards {
+    /// The contract token, 1:1 with contract.yaml.
+    pub const fn token(self) -> &'static str {
+        match self {
+            SegBoards::Main => "main",
+            SegBoards::Slot0 => "slot0",
+            SegBoards::Slot1 => "slot1",
+            SegBoards::Slot2 => "slot2",
+            SegBoards::Slot3 => "slot3",
+            SegBoards::Slot4 => "slot4",
+            SegBoards::Slot5 => "slot5",
+            SegBoards::Slot6 => "slot6",
+            SegBoards::Slot7 => "slot7",
+        }
+    }
+
+    /// Parse a token. `None` is a token this build does not know — from a device on
+    /// a newer minor, which is legal and must never be a parse failure.
+    pub fn from_token(s: &str) -> Option<Self> {
+        Some(match s {
+            "main" => SegBoards::Main,
+            "slot0" => SegBoards::Slot0,
+            "slot1" => SegBoards::Slot1,
+            "slot2" => SegBoards::Slot2,
+            "slot3" => SegBoards::Slot3,
+            "slot4" => SegBoards::Slot4,
+            "slot5" => SegBoards::Slot5,
+            "slot6" => SegBoards::Slot6,
+            "slot7" => SegBoards::Slot7,
+            _ => return None,
+        })
+    }
+}
 
 /// A mode token, 1:1 with the contract's `of:` list. One enum for every argument that
 /// takes this value set — `adio.mode` declares it twice and two identical types would be
@@ -101,7 +170,11 @@ impl ChMode {
 ///
 /// Handshake. fw/gw are the firmware and gateware git shas (8 hex) — equal when both came from one
 /// build. The identity REGISTERS carry the same gateware sha pre-boot; the device DNA is not on
-/// this command (it is AXI-side, reachable via the human `kv id`).
+/// this command (it is AXI-side, reachable via the human `kv id`, and on `sys.challenge`). `tiers`
+/// lists the tiers a session of THIS BUILD can reach, comma-joined in rank order: `public` alone
+/// means the build has no unlock and no factory command; `public,service,factory` means every tier
+/// is behind `sys.unlock`. A station tool refuses a build whose `tiers` lacks `factory` rather than
+/// failing midway.
 #[derive(Clone, Debug)]
 pub struct SysHello {
     /// The reply's `proto` value — declared `u8`.
@@ -121,6 +194,9 @@ pub struct SysHello {
 
     /// The reply's `gw` value — declared `str`.
     pub gw: String,
+
+    /// The reply's `tiers` value — declared `str`.
+    pub tiers: String,
 }
 
 impl SysHello {
@@ -132,6 +208,52 @@ impl SysHello {
             board_id: uint(r, "board_id")?,
             fw: text(r, "fw")?,
             gw: text(r, "gw")?,
+            tiers: text(r, "tiers")?,
+        })
+    }
+}
+
+/// One entry of the `id.boards` reply's `boards` list — declared `[{addr: u8, serial: str}]`.
+#[derive(Clone, Debug)]
+pub struct IdBoardsEntry {
+    /// The entry's `addr` value — declared `u8`.
+    pub addr: u8,
+
+    /// The entry's `serial` value — declared `str`.
+    pub serial: String,
+}
+
+impl IdBoardsEntry {
+    fn parse(v: &Value) -> Result<Self, Error> {
+        Ok(Self {
+            addr: uint(v, "addr")?,
+            serial: text(v, "serial")?,
+        })
+    }
+}
+
+/// The reply to `id.boards`.
+///
+/// The Serial of every Board the device can see on one I2C segment: `main` is the main bus, `slotN`
+/// is module mux channel N. Board-ignorant by design — the device scans 7-bit addresses 0x50..0x57,
+/// reads 64 bytes at register 0 with a 16-bit register address, keeps the blocks that carry a valid
+/// identity record (the internal `board_record` layout), and returns the Serial string with the
+/// address it was found at. A NAK from an EEPROM address is "no Board there", never an error; a
+/// blank EEPROM (all 0xFF or all 0x00) is "no record" and is omitted; only a stuck bus is reported
+/// — and `i2c_nak` can only mean the mux itself (`addr` 0x77) refused the channel select. One
+/// segment per call so at most 8 entries, and the reply always fits `max_body_bytes`. On a `slot`
+/// segment the device holds the mux on that channel for the transaction and restores what the power
+/// sequencer expects. Every other record field is unreachable below the factory tier.
+#[derive(Clone, Debug)]
+pub struct IdBoards {
+    /// The reply's `boards` value — declared `[{addr: u8, serial: str}]`.
+    pub boards: Vec<IdBoardsEntry>,
+}
+
+impl IdBoards {
+    fn parse(r: &Reply) -> Result<Self, Error> {
+        Ok(Self {
+            boards: objects(r, "boards", IdBoardsEntry::parse)?,
         })
     }
 }
@@ -288,8 +410,25 @@ impl AdioAdc {
 pub trait Commands {
     /// Handshake. fw/gw are the firmware and gateware git shas (8 hex) — equal when both came from
     /// one build. The identity REGISTERS carry the same gateware sha pre-boot; the device DNA is
-    /// not on this command (it is AXI-side, reachable via the human `kv id`).
+    /// not on this command (it is AXI-side, reachable via the human `kv id`, and on
+    /// `sys.challenge`). `tiers` lists the tiers a session of THIS BUILD can reach, comma-joined in
+    /// rank order: `public` alone means the build has no unlock and no factory command;
+    /// `public,service,factory` means every tier is behind `sys.unlock`. A station tool refuses a
+    /// build whose `tiers` lacks `factory` rather than failing midway.
     fn sys_hello(&mut self) -> Result<SysHello, Error>;
+
+    /// The Serial of every Board the device can see on one I2C segment: `main` is the main bus,
+    /// `slotN` is module mux channel N. Board-ignorant by design — the device scans 7-bit addresses
+    /// 0x50..0x57, reads 64 bytes at register 0 with a 16-bit register address, keeps the blocks
+    /// that carry a valid identity record (the internal `board_record` layout), and returns the
+    /// Serial string with the address it was found at. A NAK from an EEPROM address is "no Board
+    /// there", never an error; a blank EEPROM (all 0xFF or all 0x00) is "no record" and is omitted;
+    /// only a stuck bus is reported — and `i2c_nak` can only mean the mux itself (`addr` 0x77)
+    /// refused the channel select. One segment per call so at most 8 entries, and the reply always
+    /// fits `max_body_bytes`. On a `slot` segment the device holds the mux on that channel for the
+    /// transaction and restores what the power sequencer expects. Every other record field is
+    /// unreachable below the factory tier.
+    fn id_boards(&mut self, seg: SegBoards) -> Result<IdBoards, Error>;
 
     /// Read the power tree, writing nothing. present = module-present bitmask from the most recent
     /// sequence pass (a raw detect read is NOT equivalent — after a pass those bits are outputs
@@ -324,6 +463,13 @@ impl Commands for Device {
     fn sys_hello(&mut self) -> Result<SysHello, Error> {
         let reply = checked(self.raw_cmd("sys.hello", &[])?)?;
         SysHello::parse(&reply)
+    }
+
+    fn id_boards(&mut self, seg: SegBoards) -> Result<IdBoards, Error> {
+        let args: Vec<String> = vec![seg.token().to_string()];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let reply = checked(self.raw_cmd("id.boards", &args)?)?;
+        IdBoards::parse(&reply)
     }
 
     fn power_status(&mut self) -> Result<PowerStatus, Error> {
@@ -398,12 +544,12 @@ impl Commands for Device {
     }
 }
 
-// RESERVED, and deliberately without typed methods: `sys.claim`, `sys.release`, `sys.challenge`,
-// `sys.unlock`. Every one is `scope: session`, pending P3b — the grant canonicalisation and the
-// signature scheme are NOT published, so a host must not depend on the shape of what it signs, and
-// a build may legally answer `unknown_cmd` to any of them (kdi/contract.yaml:261-274). A typed
-// method here would claim a settled shape. They stay in `COMMANDS` above, so `Device::raw_cmd` can
-// still drive one positionally.
+// Deliberately without typed methods: `sys.claim`, `sys.release`, `sys.challenge`, `sys.unlock`.
+// Every one is `scope: session` — OPTIONAL, so a build may legally answer `unknown_cmd` to any of
+// them and a host proceeds (kdi/contract.yaml:476-478). A typed method would read as a promise
+// every build keeps. Their argument shapes ARE published (the unlock's grant is `tier nonce dna
+// sig`, see the contract), and they stay in `COMMANDS` above, so `Device::raw_cmd` drives one
+// positionally in the declared order.
 
 // ───────────────────────────────────────────────────────────────────── reply decoding
 //
@@ -420,31 +566,48 @@ fn bad(key: &str, want: &str) -> Error {
     )
 }
 
-fn at<'a>(r: &'a Reply, key: &str) -> Result<&'a Value, Error> {
-    r.get(key).ok_or_else(|| bad(key, "present in the reply"))
+/// A whole reply and one object inside it (an entry of a list-valued key) are read alike.
+trait Fields {
+    fn field(&self, key: &str) -> Option<&Value>;
+}
+
+impl Fields for Reply {
+    fn field(&self, key: &str) -> Option<&Value> {
+        self.get(key)
+    }
+}
+
+impl Fields for Value {
+    fn field(&self, key: &str) -> Option<&Value> {
+        self.get(key)
+    }
+}
+
+fn at<'a>(r: &'a impl Fields, key: &str) -> Result<&'a Value, Error> {
+    r.field(key).ok_or_else(|| bad(key, "present in the reply"))
 }
 
 /// Width-checked, never truncating: the device declares `present` as a u8 and a `v as u8` on a
 /// wider value would silently report a different power tree than the one that answered.
-fn uint<T: TryFrom<u64>>(r: &Reply, key: &str) -> Result<T, Error> {
+fn uint<T: TryFrom<u64>>(r: &impl Fields, key: &str) -> Result<T, Error> {
     let v = at(r, key)?
         .as_u64()
         .ok_or_else(|| bad(key, "an unsigned integer"))?;
     T::try_from(v).map_err(|_| bad(key, "in range for its declared width"))
 }
 
-fn flag(r: &Reply, key: &str) -> Result<bool, Error> {
+fn flag(r: &impl Fields, key: &str) -> Result<bool, Error> {
     at(r, key)?.as_bool().ok_or_else(|| bad(key, "a bool"))
 }
 
-fn text(r: &Reply, key: &str) -> Result<String, Error> {
+fn text(r: &impl Fields, key: &str) -> Result<String, Error> {
     Ok(at(r, key)?
         .as_str()
         .ok_or_else(|| bad(key, "a string"))?
         .to_string())
 }
 
-fn uints<T: TryFrom<u64>>(r: &Reply, key: &str) -> Result<Vec<T>, Error> {
+fn uints<T: TryFrom<u64>>(r: &impl Fields, key: &str) -> Result<Vec<T>, Error> {
     at(r, key)?
         .as_array()
         .ok_or_else(|| bad(key, "an array"))?
@@ -458,7 +621,7 @@ fn uints<T: TryFrom<u64>>(r: &Reply, key: &str) -> Result<Vec<T>, Error> {
         .collect()
 }
 
-fn flags(r: &Reply, key: &str) -> Result<Vec<bool>, Error> {
+fn flags(r: &impl Fields, key: &str) -> Result<Vec<bool>, Error> {
     at(r, key)?
         .as_array()
         .ok_or_else(|| bad(key, "an array"))?
@@ -467,8 +630,28 @@ fn flags(r: &Reply, key: &str) -> Result<Vec<bool>, Error> {
         .collect()
 }
 
-fn object(r: &Reply, key: &str) -> Result<Value, Error> {
+fn object(r: &impl Fields, key: &str) -> Result<Value, Error> {
     Ok(at(r, key)?.clone())
+}
+
+/// A list of records, each parsed by the generated entry type. An element that is not an
+/// object is an error for the same reason a missing key is: it is not the declared reply.
+fn objects<T>(
+    r: &impl Fields,
+    key: &str,
+    parse: fn(&Value) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
+    at(r, key)?
+        .as_array()
+        .ok_or_else(|| bad(key, "an array"))?
+        .iter()
+        .map(|v| {
+            if !v.is_object() {
+                return Err(bad(key, "an array of objects"));
+            }
+            parse(v)
+        })
+        .collect()
 }
 
 /// A refusal reaches a TYPED caller as `Err`, while `Device::raw_cmd` still returns it as data

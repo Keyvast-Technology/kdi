@@ -1,5 +1,5 @@
 {
-  "kdi": "0.5",
+  "kdi": "0.6",
   "device": {
     "vendor": "keyvast",
     "type": "a75",
@@ -51,7 +51,8 @@
         "sys.claim",
         "sys.release",
         "sys.challenge",
-        "sys.unlock"
+        "sys.unlock",
+        "id.boards"
       ]
     },
     "ddr3": {
@@ -117,6 +118,14 @@
     "no_device": {
       "retryable": true,
       "doc": "a Zephyr device backing this command is not ready"
+    },
+    "i2c_nak": {
+      "retryable": true,
+      "doc": "the addressed device did not ACK (absent, busy, or a write cycle in progress); `addr` names it"
+    },
+    "i2c_timeout": {
+      "retryable": false,
+      "doc": "the bus did not complete the transfer (SCL/SDA held); `addr` names the target"
     },
     "internal": {
       "retryable": false,
@@ -1081,7 +1090,7 @@
           "arg_encoding": "each value rendered as a bare token, space separated; no key=value, no quoting",
           "arg_charset": "[A-Za-z0-9_.-]+",
           "arg_charset_rule": "NORMATIVE, and a host MUST refuse a request whose id, name or any argument does not match, WITHOUT sending a byte. This wire is shared with a human shell: a value containing CR or LF appends an arbitrary `kv` command (the shell is ungated and can write EEPROMs), and one containing the response sentinel forges a reply. This is why \"no shell word is part of the contract\" is enforceable rather than merely stated.\n",
-          "envelope_on_the_wire": "`token` and `confirm` are envelope keys of the abstract request, but this binding's line form carries positional args only. Today's firmware implements no session command, so no envelope key has a wire encoding here yet; a binding that needs one must define it before a session command ships on this transport.\n"
+          "envelope_on_the_wire": "`token` and `confirm` are envelope keys of the abstract request, but this binding's line form carries positional args only. The two session commands the firmware implements, `sys.challenge` and `sys.unlock`, take positional args like every other command and need no envelope key. `token` and `confirm` still have no wire encoding here because `sys.claim`/`sys.release` are unimplemented (the device answers `unknown_cmd`); a binding that needs one must define it before a claim ships on this transport.\n"
         },
         "response": {
           "framing": "0x1e, then EXACTLY 3 lowercase ASCII hex digits giving the JSON body length, then that many bytes of UTF-8 JSON",
@@ -1133,10 +1142,13 @@
       "scope": "session",
       "args": [],
       "returns": {
-        "nonce": "str",
-        "dna": "str"
+        "nonce": "u32",
+        "dna": "u64"
       },
-      "doc": "Begin a field-service unlock: the device returns a fresh nonce bound to its FPGA DNA. RESERVED pending P3b \u2014 the grant canonicalisation and signature scheme are NOT yet published, so a host MUST NOT depend on the shape of what it signs. See docs/device_interface_plan.md \u00a79.\n"
+      "errors": [
+        "not_ready"
+      ],
+      "doc": "Begin an unlock: the device mints a fresh nonce and returns it with the FPGA DNA the grant must name. ONE outstanding challenge per device: a new challenge, a successful unlock or a reset retires the previous nonce. Refused with `not_ready` while the DNA has not been captured \u2014 a nonce is never bound to a meaningless value. `unknown_cmd` means this build has no unlock; proceed public.\n"
     },
     {
       "name": "sys.unlock",
@@ -1145,12 +1157,25 @@
       "scope": "session",
       "args": [
         {
-          "name": "grant",
-          "type": "obj"
+          "name": "tier",
+          "type": "enum",
+          "of": [
+            "service",
+            "factory"
+          ]
+        },
+        {
+          "name": "nonce",
+          "type": "u32"
+        },
+        {
+          "name": "dna",
+          "type": "u64"
         },
         {
           "name": "sig",
-          "type": "hex"
+          "type": "hex",
+          "bytes": 64
         }
       ],
       "returns": {
@@ -1161,7 +1186,8 @@
         "tier_locked",
         "bad_args"
       ],
-      "doc": "Present a signed grant to raise the session's tier. RESERVED pending P3b, as above: the grant shape ({tier, nonce, dna}) and its signing bytes are implementation detail today and will be published when the scheme is fixed. The tier comes from the GRANT, never from a separate argument.\n"
+      "worst_ms": 10000,
+      "doc": "Present a signed grant to raise the session's tier. THE GRANT IS THE THREE ARGUMENTS, and its signing bytes are the compact, key-sorted JSON object they rebuild: `{\"dna\":<dna>,\"nonce\":<nonce>,\"tier\":\"<tier>\"}` \u2014 no whitespace, integers in decimal, exactly that key order. `sig` is an Ed25519 signature (RFC 8032, 64 bytes, hex) over those bytes by a key whose public half the device holds. The device accepts iff the signature verifies, `nonce` equals its outstanding challenge, and `dna` equals its own DNA or is 0 (the wildcard). The nonce is SINGLE-USE: success or failure retires it. Refusal is `tier_locked` with an INFORMATIVE `why` \u2014 `no_key` (this build holds no public key), `no_challenge` (no outstanding nonce, or the DNA was never captured), `bad_nonce`, `bad_dna`, `bad_sig` \u2014 a host switches on `err`, never on `why`. Success returns the tier reached. THE TIER IS THE DEVICE'S, NOT A CONNECTION'S: this wire has no session boundary, so closing a link relocks nothing. It drops back to public on reset, and after 300 s in which the device saw no `kdi` command of any tier (`KEYVAST_UNLOCK_IDLE_SEC`, fixed per build); any `kdi` command restarts that clock. The wire shape is fixed now so the proof can be strengthened later without moving how a host speaks. On the usb3 binding the request line is ~190 chars (`nonce` up to 10 digits, `dna` up to 20, `sig` 128 hex), so the firmware pins `SHELL_CMD_BUFF_SIZE=256` (Zephyr's default; `SHELL_MINIMAL` would halve it and stays off). kdi/vectors/unlock_vectors.json pins the canonical bytes, a valid signature and three refusals. `worst_ms: 10000` carries 1.5x over a MEASURED **656,016,778 cycles = 6,560 ms at 100 MHz** for an accepted grant, end to end from the submitting newline to the reply, on the shipping fabric under Verilator (`make sim-unlock`). The same path with no verify, `sys.challenge`, is 48,292 cycles (0.48 ms), so the verify is essentially all of it. The cost is the CPU, not the protocol: `MulDivIterativePlugin(mulUnrollFactor = 1)` spends 33 cycles per multiply and TweetNaCl's two 256-step ladders alone are 9,216 field multiplies. A refused grant costs the same as an accepted one \u2014 measured 656,016,768 cycles for a `bad_sig` refusal, TEN cycles apart \u2014 so this covers every outcome. It is a SIM figure: it excludes host transport, and the sim's power thread contends differently than a real board's.\n"
     },
     {
       "name": "sys.hello",
@@ -1174,9 +1200,47 @@
         "kdi": "str",
         "board_id": "u32",
         "fw": "str",
-        "gw": "str"
+        "gw": "str",
+        "tiers": "str"
       },
-      "doc": "Handshake. fw/gw are the firmware and gateware git shas (8 hex) \u2014 equal when both came from one build. The identity REGISTERS carry the same gateware sha pre-boot; the device DNA is not on this command (it is AXI-side, reachable via the human `kv id`).\n"
+      "doc": "Handshake. fw/gw are the firmware and gateware git shas (8 hex) \u2014 equal when both came from one build. The identity REGISTERS carry the same gateware sha pre-boot; the device DNA is not on this command (it is AXI-side, reachable via the human `kv id`, and on `sys.challenge`). `tiers` lists the tiers a session of THIS BUILD can reach, comma-joined in rank order: `public` alone means the build has no unlock and no factory command; `public,service,factory` means every tier is behind `sys.unlock`. A station tool refuses a build whose `tiers` lacks `factory` rather than failing midway.\n"
+    },
+    {
+      "name": "id.boards",
+      "tier": "public",
+      "safety": "ro",
+      "args": [
+        {
+          "name": "seg",
+          "type": "enum",
+          "of": [
+            "main",
+            "slot0",
+            "slot1",
+            "slot2",
+            "slot3",
+            "slot4",
+            "slot5",
+            "slot6",
+            "slot7"
+          ]
+        }
+      ],
+      "returns": {
+        "boards": [
+          {
+            "addr": "u8",
+            "serial": "str"
+          }
+        ]
+      },
+      "errors": [
+        "bad_args",
+        "no_device",
+        "i2c_nak",
+        "i2c_timeout"
+      ],
+      "doc": "The Serial of every Board the device can see on one I2C segment: `main` is the main bus, `slotN` is module mux channel N. Board-ignorant by design \u2014 the device scans 7-bit addresses 0x50..0x57, reads 64 bytes at register 0 with a 16-bit register address, keeps the blocks that carry a valid identity record (the internal `board_record` layout), and returns the Serial string with the address it was found at. A NAK from an EEPROM address is \"no Board there\", never an error; a blank EEPROM (all 0xFF or all 0x00) is \"no record\" and is omitted; only a stuck bus is reported \u2014 and `i2c_nak` can only mean the mux itself (`addr` 0x77) refused the channel select. One segment per call so at most 8 entries, and the reply always fits `max_body_bytes`. On a `slot` segment the device holds the mux on that channel for the transaction and restores what the power sequencer expects. Every other record field is unreachable below the factory tier.\n"
     },
     {
       "name": "power.status",

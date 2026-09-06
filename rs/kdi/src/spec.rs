@@ -13,19 +13,28 @@
 /// The contract THIS HOST implements — the `host` half of a `Skew::Major` and the
 /// only version a caller may compare its own expectations against. The DEVICE's is
 /// `Device::kdi()`, read off the wire at bind.
-pub const KDI_VERSION: &str = "0.5";
+pub const KDI_VERSION: &str = "0.6";
 /// The contract MAJOR. A device announcing a different one must be refused at bind: majors are not
 /// compatible, and the traffic that would follow cannot be trusted.
 pub const KDI_MAJOR: u16 = 0;
 /// The contract MINOR. ADDITIVE by definition — a device on a HIGHER minor binds normally, and a
 /// host must never do version arithmetic beyond the major equality test.
-pub const KDI_MINOR: u16 = 5;
+pub const KDI_MINOR: u16 = 6;
 /// Every frame carries the contract's MINOR in `contract_rev`.
 pub const CONTRACT_REV: u16 = KDI_MINOR;
 /// How long a host must be willing to poll `contract_ready` before giving up, in milliseconds. A
 /// DEVICE property, published so that a slower-booting board does not turn into a fleet of hosts
 /// that each need a patch.
 pub const READY_TIMEOUT_MS: u64 = 3000;
+/// Each command's declared worst-case latency, in milliseconds. A host derives its reply deadline
+/// from this: the contract published the field and no host read it, so every command shared one
+/// flat wait and anything slower than it was simply unreachable.
+pub const WORST_MS: &[(&str, u64)] = &[
+    ("adio.adc", 5),
+    ("power.status", 50),
+    ("power.up", 1400),
+    ("sys.unlock", 10000),
+];
 /// A pipe read on the usb3 binding must be a multiple of this many bytes. A BINDING
 /// property, not a codec constant — an ethernet binding has a different one or none.
 pub const USB3_READ_ALIGNMENT: usize = 16;
@@ -163,7 +172,8 @@ pub enum Cap {
     /// same .bit)
     ///
     /// Gates: commands `sys.hello`, `power.status`, `power.up`, `adio.mode`, `adio.adc`, `adio.fb`,
-    /// `adio.dout`, `gnd.eeprom.read`, `sys.claim`, `sys.release`, `sys.challenge`, `sys.unlock`.
+    /// `adio.dout`, `gnd.eeprom.read`, `sys.claim`, `sys.release`, `sys.challenge`, `sys.unlock`,
+    /// `id.boards`.
     CommandProtocol,
 
     /// the DDR3 pipe buffer is present and calibrated; without it a stream's depth is the on-chip
@@ -285,6 +295,17 @@ pub enum DeviceErr {
     /// Retryable: another attempt may answer differently.
     NoDevice,
 
+    /// the addressed device did not ACK (absent, busy, or a write cycle in progress); `addr` names
+    /// it
+    ///
+    /// Retryable: another attempt may answer differently.
+    I2cNak,
+
+    /// the bus did not complete the transfer (SCL/SDA held); `addr` names the target
+    ///
+    /// Not retryable: the same call will be refused again.
+    I2cTimeout,
+
     /// firmware bug — report it with the rc
     ///
     /// Not retryable: the same call will be refused again.
@@ -336,6 +357,8 @@ impl DeviceErr {
             DeviceErr::NotPresent => "not_present",
             DeviceErr::NoIp => "no_ip",
             DeviceErr::NoDevice => "no_device",
+            DeviceErr::I2cNak => "i2c_nak",
+            DeviceErr::I2cTimeout => "i2c_timeout",
             DeviceErr::Internal => "internal",
             DeviceErr::Busy => "busy",
             DeviceErr::NotClaimed => "not_claimed",
@@ -357,6 +380,8 @@ impl DeviceErr {
             "not_present" => DeviceErr::NotPresent,
             "no_ip" => DeviceErr::NoIp,
             "no_device" => DeviceErr::NoDevice,
+            "i2c_nak" => DeviceErr::I2cNak,
+            "i2c_timeout" => DeviceErr::I2cTimeout,
             "internal" => DeviceErr::Internal,
             "busy" => DeviceErr::Busy,
             "not_claimed" => DeviceErr::NotClaimed,
