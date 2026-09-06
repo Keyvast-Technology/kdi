@@ -13,13 +13,13 @@
 /// The contract THIS HOST implements — the `host` half of a `Skew::Major` and the
 /// only version a caller may compare its own expectations against. The DEVICE's is
 /// `Device::kdi()`, read off the wire at bind.
-pub const KDI_VERSION: &str = "0.6";
+pub const KDI_VERSION: &str = "0.7";
 /// The contract MAJOR. A device announcing a different one must be refused at bind: majors are not
 /// compatible, and the traffic that would follow cannot be trusted.
 pub const KDI_MAJOR: u16 = 0;
 /// The contract MINOR. ADDITIVE by definition — a device on a HIGHER minor binds normally, and a
 /// host must never do version arithmetic beyond the major equality test.
-pub const KDI_MINOR: u16 = 6;
+pub const KDI_MINOR: u16 = 7;
 /// Every frame carries the contract's MINOR in `contract_rev`.
 pub const CONTRACT_REV: u16 = KDI_MINOR;
 /// How long a host must be willing to poll `contract_ready` before giving up, in milliseconds. A
@@ -455,6 +455,7 @@ pub(crate) const USB3_REG: &[(&str, &str, u8, Option<u8>, u8)] = &[
     ("occupancy", "wireout", 0x20, None, 32),
     ("overflow", "wireout", 0x31, Some(0), 1),
     ("console_tx_drop", "wireout", 0x31, Some(2), 1),
+    ("miso_delay", "wirein", 0x04, None, 32),
     ("rate_md", "wirein", 0x03, None, 32),
     ("rate_apply", "triggerin", 0x40, Some(0), 1),
     ("rate_ready", "wireout", 0x3B, Some(0), 1),

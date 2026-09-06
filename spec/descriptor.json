@@ -1,5 +1,5 @@
 {
-  "kdi": "0.6",
+  "kdi": "0.7",
   "device": {
     "vendor": "keyvast",
     "type": "a75",
@@ -197,6 +197,11 @@
     }
   ],
   "fastpath_registers": [
+    {
+      "name": "miso_delay",
+      "access": "rw",
+      "doc": "4 bits per port: A=[3:0] B=[7:4] .. H=[31:28]. The MISO sampling tap. A WRONG VALUE DEGRADES SILENTLY -- amplitude falls per channel with no error anywhere. Sweep it against a known readback; the device publishes no optimum"
+    },
     {
       "name": "rate_md",
       "access": "rw",
@@ -1062,6 +1067,7 @@
         "occupancy": "wireout:0x20",
         "overflow": "wireout:0x31.0",
         "console_tx_drop": "wireout:0x31.2",
+        "miso_delay": "wirein:0x04",
         "rate_md": "wirein:0x03",
         "rate_apply": "triggerin:0x40.0",
         "rate_ready": "wireout:0x3b.0"

@@ -470,7 +470,7 @@ impl Device {
         d.gateware_sha = d.read_reg("gateware_sha")?;
         // LAST, and only when the device advertises a command channel. Without that capability
         // there is nothing to claim; with it, every non-RO command is refused `not_claimed` until
-        // the request carries the holder's token (`kdi/device.py:214-214`).
+        // the request carries the holder's token (`kdi/device.py:405-405`).
         d.lease = if d.caps.has(Cap::CommandProtocol) {
             d.claim()?
         } else {
@@ -664,6 +664,54 @@ impl Device {
                 "rate_ready stayed clear after {RATE_APPLY_TRIES} attempts to program the rate"
             ),
         ))
+    }
+
+    /// Set the MISO sampling tap, one 4-bit value per port: `taps[0]` is port A, `taps[7]` port H.
+    ///
+    /// A WRONG VALUE DEGRADES SILENTLY. Amplitude falls per channel with no error anywhere -- no
+    /// CRC fails, no counter moves, the frames stay well formed. Measured against a legacy host on
+    /// the same headstage: an uncalibrated tap read 0.43 of the per-channel stddev, and the ratio
+    /// varied by channel, so a single "looks like data" glance passes.
+    ///
+    /// The device publishes no optimum and cannot compute one: the right tap depends on cable
+    /// length, and the unit is a dataclk period, so it MOVES when the sample rate changes.
+    /// Sweeping it against a known readback is the host's job, and re-sweeping after
+    /// [`Device::set_rate`] is part of that job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any tap exceeds 15 -- the field is four bits and
+    /// silently truncating would program a different tap than the caller asked for, which is the
+    /// one failure this register cannot afford.
+    pub fn set_miso_delay(&mut self, taps: [u8; 8]) -> Result<(), Error> {
+        let mut word = 0u32;
+        for (port, &tap) in taps.iter().enumerate() {
+            if tap > 15 {
+                return Err(io_err(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "miso_delay tap for port {} is {tap}; the field is 4 bits, so 0..=15",
+                        // ASCII only, and a letter is what the contract and every cable label use.
+                        (b'A' + port as u8) as char
+                    ),
+                ));
+            }
+            word |= u32::from(tap) << (port * 4);
+        }
+        self.write_field("miso_delay", word)
+    }
+
+    /// The MISO sampling tap currently programmed, one 4-bit value per port, A first.
+    ///
+    /// Read back rather than remembered: the engine's host reset reverts device state a host did
+    /// not choose, so what a host wrote is not what is necessarily set.
+    pub fn miso_delay(&mut self) -> Result<[u8; 8], Error> {
+        let word = self.read_reg("miso_delay")?;
+        let mut taps = [0u8; 8];
+        for (port, tap) in taps.iter_mut().enumerate() {
+            *tap = ((word >> (port * 4)) & 0xf) as u8;
+        }
+        Ok(taps)
     }
 
     fn read_reg(&mut self, name: &str) -> Result<u32, Error> {
