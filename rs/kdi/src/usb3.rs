@@ -4,6 +4,7 @@
 
 use std::ffi::{c_char, c_int, c_long, c_uchar, c_ulong, c_void, CStr, CString};
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -437,20 +438,10 @@ impl Usb3 {
         &mut self,
         id: &str,
         name: &str,
-        args: &[&str],
+        args: &[(&str, crate::Arg<'_>)],
         _token: &str,
     ) -> Result<Reply, Error> {
-        // `request.line`: "kdi <id> <name> <arg>*\r", args positional in declared order.
-        let mut line = String::from(crate::REQ_TAG);
-        line.push_str(id);
-        line.push(' ');
-        line.push_str(name);
-        for a in args {
-            line.push(' ');
-            line.push_str(a);
-        }
-        // `terminator: "\r"`. The charset check that makes this safe already ran in `Device::cmd`.
-        line.push('\r');
+        let line = request_line(id, name, args);
 
         // Drain first: the console emits banners and prior output on this same wire, and a stale
         // frame left in the buffer would be scanned as this command's answer (`response.rules`).
@@ -668,8 +659,55 @@ pub(crate) fn enumerate() -> Result<Vec<DeviceInfo>, Error> {
     Ok(out)
 }
 
+/// `request.line`: `"kdi <id> <name> <arg>*\r"`, values positional IN THE ORDER GIVEN. The names
+/// the udp envelope keys by are dropped — this form has nowhere to put them, which is why a
+/// positional-only host never noticed the udp side could not name them at all (#179).
+fn request_line(id: &str, name: &str, args: &[(&str, crate::Arg<'_>)]) -> String {
+    let mut line = String::from(crate::REQ_TAG);
+    line.push_str(id);
+    line.push(' ');
+    line.push_str(name);
+    for (_, a) in args {
+        line.push(' ');
+        let _ = write!(line, "{a}");
+    }
+    // `terminator: "\r"`. The charset check that makes this safe already ran in `Device::cmd`.
+    line.push('\r');
+    line
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::Arg::{Int, Text};
+
+    /// The vUART half of #179: `raw_cmd_named`'s pairs must reach the line as BARE TOKENS in the
+    /// order given, with the names gone and `Int`/`Text` indistinguishable — the same call the
+    /// udp binding keys an object from. Nothing else can see this without a board.
+    #[test]
+    fn the_line_carries_the_values_positionally_and_drops_the_names() {
+        let args = [
+            ("bus", Text("module")),
+            ("ch", Int(0)),
+            ("addr", Int(0x52)),
+            ("data", Text("02")),
+        ];
+        assert_eq!(
+            super::request_line("7", "x.y", &args),
+            "kdi 7 x.y module 0 82 02\r"
+        );
+        // A transposition is a DIFFERENT line, which is the whole reason the order is the caller's
+        // to get right: the device sees tokens, and nothing on this wire can name them back.
+        let swapped = [args[1], args[0], args[2], args[3]];
+        assert_ne!(
+            super::request_line("7", "x.y", &swapped),
+            super::request_line("7", "x.y", &args)
+        );
+        assert_eq!(
+            super::request_line("1", "sys.hello", &[]),
+            "kdi 1 sys.hello\r"
+        );
+    }
+
     #[test]
     fn an_empty_image_is_rejected_before_the_driver_is_loaded() {
         let Err(crate::Error::Io(e)) = super::Usb3::open("", None, Some(&[])) else {

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::{io_err, reply_from, Error, Reply, COMMANDS};
+use crate::{io_err, reply_from, Arg, Error, Reply};
 use std::io;
 
 /// One request datagram -> one reply datagram, max 65535 B (`bindings.udp.rpc.framing`).
@@ -15,34 +15,17 @@ const MAX_DGRAM: usize = 65535;
 
 /// Envelope `args` is an OBJECT KEYED BY NAME; only the vUART line is positional. As a JSON
 /// ARRAY it validates with NO args, so every argumented command answered `bad_args`/`missing`.
-/// Names come from the generated `COMMANDS`, in declared order (contract:770).
-fn named(name: &str, args: &[&str]) -> Value {
-    // Unknown command, or more arguments than it declares: hand the envelope over as-is. The
-    // device answers `unknown_cmd` before it looks at arguments, and a surplus argument must reach
-    // it to be rejected rather than be silently dropped by a zip.
-    let Some((_, keys)) = COMMANDS.iter().find(|(n, _)| *n == name) else {
-        return json!(args.iter().map(|a| scalar(a)).collect::<Vec<Value>>());
-    };
-    if args.len() > keys.len() {
-        return json!(args.iter().map(|a| scalar(a)).collect::<Vec<Value>>());
+/// An EMPTY name means there are none to key by, so the array is what the device must judge.
+fn named(args: &[(&str, Arg<'_>)]) -> Value {
+    if args.iter().any(|(k, _)| k.is_empty()) {
+        return Value::Array(args.iter().map(|(_, v)| v.json()).collect());
     }
-    // Fewer is legal and ordinary: a trailing optional argument is simply absent.
+    // Fewer arguments than declared is legal and ordinary: a trailing optional is simply absent.
     Value::Object(
-        keys.iter()
-            .zip(args)
-            .map(|(k, a)| ((*k).to_string(), scalar(a)))
+        args.iter()
+            .map(|(k, v)| ((*k).to_string(), v.json()))
             .collect(),
     )
-}
-
-/// A bare token is untyped on the wire; JSON is not. An integer-looking argument is sent as a
-/// number because that is what the contract declares (`type: u8`) and what the device validates
-/// against.
-fn scalar(a: &str) -> Value {
-    match a.parse::<i64>() {
-        Ok(n) => json!(n),
-        Err(_) => json!(a),
-    }
 }
 
 pub(crate) struct Udp {
@@ -165,12 +148,12 @@ impl Udp {
         &mut self,
         id: &str,
         name: &str,
-        args: &[&str],
+        args: &[(&str, Arg<'_>)],
         token: &str,
     ) -> Result<Reply, Error> {
         let v = self.rpc_json(&json!({
             "op": "message",
-            "req": {"id": id, "name": name, "args": named(name, args), "token": token},
+            "req": {"id": id, "name": name, "args": named(args), "token": token},
         }))?;
         let resp = v.get("resp").cloned().ok_or_else(|| {
             io_err(

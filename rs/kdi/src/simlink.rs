@@ -166,7 +166,7 @@ impl Sim {
         &mut self,
         _id: &str,
         name: &str,
-        _args: &[&str],
+        _args: &[(&str, crate::Arg<'_>)],
         _token: &str,
     ) -> Result<Reply, Error> {
         Err(io_err(

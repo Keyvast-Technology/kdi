@@ -547,12 +547,48 @@ impl Device {
     /// Send a command by NAME, args POSITIONAL in declared order (contract.yaml:263). `rc != 0` is
     /// `Ok(Reply)` — a device error is DATA. An escape hatch for a newer minor; prefer the typed
     /// [`Commands`]. A token off `ARG_CHARSET` is `HostUnsafeArg`, unsent: a CR appends a `kv` cmd.
+    ///
+    /// Argument NAMES come from the generated [`COMMANDS`], which carries the PUBLISHED commands
+    /// only — so a command this crate does not carry reaches the UDP envelope unnamed, and the
+    /// device answers `internal` (#179). Drive those with [`Device::raw_cmd_named`].
     pub fn raw_cmd(&mut self, name: &str, args: &[&str]) -> Result<Reply, Error> {
-        self.next_id = self.next_id.wrapping_add(1);
-        let id = format!("{:x}", self.next_id);
-        if !safe_token(name) || !args.iter().all(|a| safe_token(a)) {
+        if !args.iter().all(|a| safe_token(a)) {
             return Err(Error::Host(HostErr::HostUnsafeArg));
         }
+        self.send(name, &positional(name, args))
+    }
+
+    /// Send a command whose ARGUMENT NAMES AND JSON TYPES the caller supplies, in declared order.
+    /// The escape hatch for a command absent from [`COMMANDS`] — every non-public tier, by design,
+    /// and [`Device::raw_cmd`] cannot name one, so over UDP it cannot address one at all (#179).
+    ///
+    /// The caller owns the type because the crate cannot tell a `hex` argument from a `u8` one for
+    /// a command it does not carry ([`Arg`]). The vUART binding sends the values positionally in
+    /// the order given and ignores the names, so ONE call drives both bindings unchanged.
+    ///
+    /// ```no_run
+    /// # fn f(d: &mut kdi::Device) -> Result<(), kdi::Error> {
+    /// use kdi::Arg::{Int, Text};
+    /// // `data` is `hex`: a string on the wire, digits and all, or it arrives as the number 2.
+    /// d.raw_cmd_named("vendor.poke", &[("addr", Int(0x50)), ("data", Text("02"))])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn raw_cmd_named(&mut self, name: &str, args: &[(&str, Arg<'_>)]) -> Result<Reply, Error> {
+        // A name is a wire token on the same terms as a value, and an EMPTY one is how
+        // `positional` marks "no declared names for this command" — never reachable from a caller
+        // that claims to know them, or a typo would silently send the whole envelope positionally.
+        if !args.iter().all(|(k, v)| safe_token(k) && v.is_safe()) {
+            return Err(Error::Host(HostErr::HostUnsafeArg));
+        }
+        self.send(name, args)
+    }
+
+    fn send(&mut self, name: &str, args: &[(&str, Arg<'_>)]) -> Result<Reply, Error> {
+        if !safe_token(name) {
+            return Err(Error::Host(HostErr::HostUnsafeArg));
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = format!("{:x}", self.next_id);
         debug_assert!(safe_token(&id));
         // The lease token rides on EVERY request, claim included, exactly as the reference does
         // (`kdi/client.py:142`). It is an envelope key and never an argument, so it is not subject
@@ -873,7 +909,7 @@ impl Link {
         &mut self,
         id: &str,
         name: &str,
-        args: &[&str],
+        args: &[(&str, Arg<'_>)],
         token: &str,
     ) -> Result<Reply, Error> {
         match self {
@@ -1141,6 +1177,70 @@ pub(crate) fn io_or_timeout(e: io::Error) -> Error {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Host(HostErr::HostTimeout),
         _ => Error::Io(e),
     }
+}
+
+/// One argument of a [`Device::raw_cmd_named`] call, carrying the JSON type the UDP envelope
+/// needs. `Int` is a JSON number and `Text` a JSON string; the vUART line renders both as the
+/// bare token, so the choice is invisible there and load-bearing here.
+///
+/// The device VALIDATES on the type (`kdi/device.py` `_validate`): an integer argument must be a
+/// number and a `hex` one a string, so `Text("02")` and `Int(2)` are not interchangeable. Only the
+/// caller can tell them apart for a command [`COMMANDS`] does not carry — that is the whole point.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Arg<'a> {
+    /// An integer-typed argument (`u8`, `u16`, `u32`): a JSON number.
+    Int(i64),
+    /// An `enum`- or `hex`-typed argument: a JSON string, all-digit or not.
+    Text(&'a str),
+}
+
+impl Arg<'_> {
+    fn is_safe(&self) -> bool {
+        match self {
+            // A decimal rendering is `[0-9-]`, which `ARG_CHARSET` allows by construction.
+            Arg::Int(_) => true,
+            Arg::Text(t) => safe_token(t),
+        }
+    }
+
+    pub(crate) fn json(&self) -> Value {
+        match *self {
+            Arg::Int(n) => Value::from(n),
+            Arg::Text(t) => Value::from(t),
+        }
+    }
+}
+
+/// The vUART line form: the bare token, whichever variant carries it.
+impl fmt::Display for Arg<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Arg::Int(n) => write!(f, "{n}"),
+            Arg::Text(t) => f.write_str(t),
+        }
+    }
+}
+
+/// Name a positional [`Device::raw_cmd`] call's arguments from [`COMMANDS`], in declared order
+/// (contract:770). An UNKNOWN command, or MORE than it declares, names NONE of them: `unknown_cmd`
+/// precedes any argument, and a surplus one must reach the device to be refused, not be zipped off.
+fn positional<'a>(name: &str, args: &'a [&'a str]) -> Vec<(&'a str, Arg<'a>)> {
+    let keys = COMMANDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, k)| *k)
+        .filter(|k| args.len() <= k.len())
+        .unwrap_or(&[]);
+    args.iter()
+        .enumerate()
+        // A bare token is untyped on the wire; JSON is not. An integer-looking argument goes as a
+        // number because that is what the contract declares (`type: u8`) and what the device
+        // validates against — the rule a `hex` argument needs `Arg::Text` to escape.
+        .map(|(i, a)| {
+            let v = a.parse::<i64>().map_or(Arg::Text(a), Arg::Int);
+            (keys.get(i).copied().unwrap_or(""), v)
+        })
+        .collect()
 }
 
 /// The compiled form of `ARG_CHARSET`. `charset_matches_spec` below fails if the contract ever

@@ -3,7 +3,7 @@
   "kdi": "0.7",
   "compatible": "keyvast-a75",
   "gateware": {
-    "git_sha": "1699470",
+    "git_sha": "18ce211",
     "build_unix": 0,
     "dirty": false,
     "note": "software reference + usb3 binding (see the compatibility matrix)"
@@ -11,8 +11,8 @@
   "artifacts": [
     {
       "name": "descriptor.json",
-      "size": 60289,
-      "checksum": "sha256:6f67a79402591c77766ee3c443996e671288aef71eee3924484f0c596fa13c20"
+      "size": 60319,
+      "checksum": "sha256:3ebe8c0cd56ab660fcb809778116c8e94b2cec7c8bc698b441f74708650dd0ce"
     },
     {
       "name": "schema.json",
@@ -21,8 +21,8 @@
     },
     {
       "name": "KDI-0.7.md",
-      "size": 39401,
-      "checksum": "sha256:1467532addff786cacd3277ce2dfa9d8d6a630d27cc982379906603484698dec"
+      "size": 39431,
+      "checksum": "sha256:7a92a886b0ce067400e583bbd57f90907e48bc8ec158130ce7ad5820bed35e8c"
     }
   ],
   "conformance": {
