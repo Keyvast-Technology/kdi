@@ -1,0 +1,14 @@
+# Dependency updates: Dependabot (first-party), the org template in Keyvast-Technology/.github README.
+# One grouped PR per ecosystem per interval; Dependabot's default 3-day cooldown applies. Security updates
+# are on for every repo and arrive on their own, as soon as an advisory lands.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
